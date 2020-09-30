@@ -82,6 +82,22 @@ const roomState = {
 
 expressApp.use(express.static(__dirname));
 
+function startHttpsServer() {
+  const https = require('https');
+
+  const tls = {
+    cert: fs.readFileSync(config.sslCrt),
+    key: fs.readFileSync(config.sslKey),
+  };
+  return https.createServer(tls, expressApp);
+}
+
+function startHttpServer() {
+  const http = require('http');
+  const server = http.createServer(expressApp);
+  return server;
+}
+
 //
 // main() -- our execution entry point
 //
@@ -93,33 +109,31 @@ async function main() {
 
   // start https server, falling back to http if https fails
   console.log('starting express');
+  let server;
   try {
-    const tls = {
-      cert: fs.readFileSync(config.sslCrt),
-      key: fs.readFileSync(config.sslKey),
-    };
-    httpsServer = https.createServer(tls, expressApp);
-    httpsServer.on('error', (e) => {
-      console.error('https server error,', e.message);
-    });
-    await new Promise((resolve) => {
-      httpsServer.listen(config.httpPort, config.httpIp, () => {
-        console.log(`server is running and listening on ` +
-                    `https://${config.httpIp}:${config.httpPort}`);
-        resolve();
-      });
-    });
+    server = createHttpsServer();
   } catch (e) {
     if (e.code === 'ENOENT') {
       console.error('no certificates found (check config.js)');
       console.error('  could not start https server ... trying http');
+      server = createHttpServer();
     } else {
-      err('could not start https server', e);
+      throw e;
     }
     expressApp.listen(config.httpPort, config.httpIp, () => {
       console.log(`http server listening on port ${config.httpPort}`);
     });
   }
+
+  server.on('error', (e) => {
+    console.error('https server error,', e.message);
+  });
+
+  server.listen(config.httpPort, config.httpIp, () => {
+    console.log(`server is running and listening on ` +
+                    `https://${config.httpIp}:${config.httpPort}`);
+  });
+
 
   // periodically clean up peers that disconnected without sending us
   // a final "beacon"
@@ -137,7 +151,7 @@ async function main() {
   setInterval(updatePeerStats, 3000);
 }
 
-main();
+main().catch(console.error);
 
 
 //
