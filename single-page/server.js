@@ -82,7 +82,7 @@ const roomState = {
 
 expressApp.use(express.static(__dirname));
 
-function startHttpsServer() {
+function createHttpsServer() {
   const https = require('https');
 
   const tls = {
@@ -92,10 +92,19 @@ function startHttpsServer() {
   return https.createServer(tls, expressApp);
 }
 
-function startHttpServer() {
+function createHttpServer() {
   const http = require('http');
   const server = http.createServer(expressApp);
   return server;
+}
+
+let io;
+
+function updatePeers() {
+  io.emit("peers", {
+    peers: roomState.peers,
+    activeSpeaker: roomState.activeSpeaker
+  });
 }
 
 //
@@ -120,13 +129,11 @@ async function main() {
     } else {
       throw e;
     }
-    expressApp.listen(config.httpPort, config.httpIp, () => {
-      console.log(`http server listening on port ${config.httpPort}`);
-    });
   }
 
   server.on('error', (e) => {
     console.error('https server error,', e.message);
+    process.exit(1);
   });
 
   server.listen(config.httpPort, config.httpIp, () => {
@@ -134,6 +141,25 @@ async function main() {
                     `https://${config.httpIp}:${config.httpPort}`);
   });
 
+  // Socket.io
+  io = require('socket.io')(server, { serveClient: false });
+
+  io.on('connection', socket => {
+    function logSocket(msg) {
+      console.log(`[${new Date().toISOString()}] ${socket.id} ${msg}`)
+    }
+
+    logSocket("socketio connection");
+
+    socket.emit("peers", {
+      peers: roomState.peers,
+      activeSpeaker: roomState.activeSpeaker
+    });
+
+    socket.on('disconnect', () => {
+      logSocket(`socketio disconnect`);
+    });
+  });
 
   // periodically clean up peers that disconnected without sending us
   // a final "beacon"
@@ -143,6 +169,7 @@ async function main() {
       if ((now - p.lastSeenTs) > config.httpPeerStale) {
         warn(`removing stale peer ${id}`);
         closePeer(id);
+        updatePeers();
       }
     });
   }, 1000);
@@ -253,8 +280,21 @@ expressApp.post('/signaling/join-as-new-peer', async (req, res) => {
     };
 
     res.send({ routerRtpCapabilities: router.rtpCapabilities });
+
+    updatePeers();
   } catch (e) {
     console.error('error in /signaling/join-as-new-peer', e);
+    res.send({ error: e });
+  }
+});
+
+// --> /signaling/router-capabilities
+//
+//
+expressApp.post('/signaling/router-capabilities', async (req, res) => {
+  try {
+    res.send({ routerRtpCapabilities: router.rtpCapabilities });
+  } catch (e) {
     res.send({ error: e });
   }
 });
@@ -271,6 +311,8 @@ expressApp.post('/signaling/leave', async (req, res) => {
 
     await closePeer(peerId);
     res.send({ left: true });
+
+    updatePeers();
   } catch (e) {
     console.error('error in /signaling/leave', e);
     res.send({ error: e });
@@ -318,6 +360,8 @@ async function closeProducer(producer) {
       delete (roomState.peers[producer.appData.peerId]
               .media[producer.appData.mediaTag]);
     }
+
+    updatePeers();
   } catch (e) {
     err(e);
   }
@@ -354,6 +398,8 @@ expressApp.post('/signaling/create-transport', async (req, res) => {
     res.send({
       transportOptions: { id, iceParameters, iceCandidates, dtlsParameters }
     });
+
+    updatePeers();
   } catch (e) {
     console.error('error in /signaling/create-transport', e);
     res.send({ error: e });
@@ -398,6 +444,8 @@ expressApp.post('/signaling/connect-transport', async (req, res) => {
 
     await transport.connect({ dtlsParameters });
     res.send({ connected: true });
+
+    updatePeers();
   } catch (e) {
     console.error('error in /signaling/connect-transport', e);
     res.send({ error: e });
@@ -424,6 +472,8 @@ expressApp.post('/signaling/close-transport', async (req, res) => {
 
     await closeTransport(transport);
     res.send({ closed: true });
+
+    updatePeers();
   } catch (e) {
     console.error('error in /signaling/close-transport', e);
     res.send({ error: e.message });
@@ -449,6 +499,8 @@ expressApp.post('/signaling/close-producer', async (req, res) => {
 
     await closeProducer(producer);
     res.send({ closed: true });
+
+    updatePeers();
   } catch (e) {
     console.error(e);
     res.send({ error: e.message });
@@ -499,7 +551,11 @@ expressApp.post('/signaling/send-track', async (req, res) => {
     };
 
     res.send({ id: producer.id });
+
+    updatePeers();
   } catch (e) {
+    console.error(e);
+    res.send({ error: e.message });
   }
 });
 
