@@ -1,7 +1,9 @@
-const config = require('./config');
+const config = require('../config');
 const debugModule = require('debug');
-const mediasoup = require('mediasoup');
-const express = require('express');
+import * as mediasoup from "mediasoup";
+import express from "express";
+import socketio from "socket.io";
+
 const https = require('https');
 const fs = require('fs');
 
@@ -12,14 +14,65 @@ const log = debugModule('demo-app');
 const warn = debugModule('demo-app:WARN');
 const err = debugModule('demo-app:ERROR');
 
+// TODO: Is this the most graceful way?
+import type { Consumer } from "mediasoup/lib/Consumer";
+import type { Producer } from "mediasoup/lib/Producer";
+import type { Transport } from "mediasoup/lib/Transport";
+import type { Router } from "mediasoup/lib/Router";
+import type { Worker } from "mediasoup/lib/Worker";
+import type { AudioLevelObserver } from "mediasoup/lib/AudioLevelObserver";
+
+import type { Socket } from "socket.io";
+
 // one mediasoup worker and router
 //
-let worker, router, audioLevelObserver;
+let worker: Worker, 
+  router: Router, 
+  audioLevelObserver: AudioLevelObserver;
+
+type Peer = {
+  joinTs: number,
+  lastSeenTs: number,
+  media: { [key: string]: Media },
+  stats: { 
+    producers: {[key: string]: Array<ProducerStats>}
+    consumers: {[key: string]: ConsumerStats}
+  },
+  consumerLayers: {[key: string]: { currentLayer: string | null, clientSelectedLayer: boolean | null } }
+};
+
+type Room = {
+  peers: { [key: string]: Peer },
+  activeSpeaker: { producerId: string | null, volume: number | null, peerId: string | null },
+  transports: {[key: string]: Transport },
+  producers: Array<Producer>,
+  consumers: Array<Consumer>
+};
+
+type Media = {
+  paused: boolean,
+  encodings: object
+};
+
+type ProducerStats = {
+  bitrate: number,
+  fractionLost: number,
+  jitter: number,
+  score: number,
+  rid: string | undefined
+};
+
+type ConsumerStats = {
+  bitrate: number,
+  fractionLost: number,
+  score: number
+};
+
 
 //
 // and one "room" ...
 //
-const roomState = {
+const roomState: Room = {
   // external
   peers: {},
   activeSpeaker: { producerId: null, volume: null, peerId: null },
@@ -27,7 +80,8 @@ const roomState = {
   transports: {},
   producers: [],
   consumers: []
-}
+};
+
 //
 // for each peer that connects, we keep a table of peers and what
 // tracks are being sent and received. we also need to know the last
@@ -98,7 +152,7 @@ function createHttpServer() {
   return server;
 }
 
-let io;
+let io: Socket;
 
 function updatePeers() {
   io.emit("peers", {
@@ -131,7 +185,7 @@ async function main() {
     }
   }
 
-  server.on('error', (e) => {
+  server.on('error', (e: Error) => {
     console.error('https server error,', e.message);
     process.exit(1);
   });
@@ -145,7 +199,7 @@ async function main() {
   io = require('socket.io')(server, { serveClient: false });
 
   io.on('connection', socket => {
-    function logSocket(msg) {
+    function logSocket(msg: string) {
       console.log(`[${new Date().toISOString()}] ${socket.id} ${msg}`)
     }
 
@@ -276,7 +330,7 @@ expressApp.post('/signaling/join-as-new-peer', async (req, res) => {
     roomState.peers[peerId] = {
       joinTs: now,
       lastSeenTs: now,
-      media: {}, consumerLayers: {}, stats: {}
+      media: {}, consumerLayers: {}, stats: { producers: {}, consumers: {}}
     };
 
     res.send({ routerRtpCapabilities: router.rtpCapabilities });
@@ -319,7 +373,7 @@ expressApp.post('/signaling/leave', async (req, res) => {
   }
 });
 
-function closePeer(peerId) {
+function closePeer(peerId: string) {
   log('closing peer', peerId);
   for (let [id, transport] of Object.entries(roomState.transports)) {
     if (transport.appData.peerId === peerId) {
@@ -329,7 +383,7 @@ function closePeer(peerId) {
   delete roomState.peers[peerId];
 }
 
-async function closeTransport(transport) {
+async function closeTransport(transport: Transport) {
   try {
     log('closing transport', transport.id, transport.appData);
 
@@ -346,7 +400,7 @@ async function closeTransport(transport) {
   }
 }
 
-async function closeProducer(producer) {
+async function closeProducer(producer: Producer) {
   log('closing producer', producer.id, producer.appData);
   try {
     await producer.close();
@@ -367,7 +421,7 @@ async function closeProducer(producer) {
   }
 }
 
-async function closeConsumer(consumer) {
+async function closeConsumer(consumer: Consumer) {
   log('closing consumer', consumer.id, consumer.appData);
   await consumer.close();
 
@@ -406,7 +460,8 @@ expressApp.post('/signaling/create-transport', async (req, res) => {
   }
 });
 
-async function createWebRtcTransport({ peerId, direction }) {
+async function createWebRtcTransport(params: { peerId: string, direction: string }) {
+  const { peerId, direction } = params;
   const {
     listenIps,
     initialAvailableOutgoingBitrate
@@ -826,7 +881,7 @@ async function updatePeerStats() {
     try {
       let stats = await producer.getStats(),
           peerId = producer.appData.peerId;
-      roomState.peers[peerId].stats[producer.id] = stats.map((s) => ({
+      roomState.peers[peerId].stats.producers[producer.id] = stats.map((s) => ({
         bitrate: s.bitrate,
         fractionLost: s.fractionLost,
         jitter: s.jitter,
@@ -846,7 +901,7 @@ async function updatePeerStats() {
       if (!stats || !roomState.peers[peerId]) {
         continue;
       }
-      roomState.peers[peerId].stats[consumer.id] = {
+      roomState.peers[peerId].stats.consumers[consumer.id] = {
         bitrate: stats.bitrate,
         fractionLost: stats.fractionLost,
         score: stats.score
