@@ -3,7 +3,7 @@ const debugModule = require('debug');
 import * as mediasoup from "mediasoup";
 import express from "express";
 import socketio from "socket.io";
-import Sentry from "@sentry/node";
+import * as Sentry from "@sentry/node";
 
 Sentry.init({ dsn: process.env["SENTRY_DSN"] });
 
@@ -204,6 +204,11 @@ async function main() {
 
     socket.on('disconnect', () => {
       logSocket(`socketio disconnect`);
+    });
+
+    socket.on('chat-message', (data: object) => {
+      logSocket('chat-message')
+      io.emit('chat-message', data);
     });
   });
 
