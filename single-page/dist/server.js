@@ -34,7 +34,6 @@ const expressApp = express_1.default();
 expressApp.disable("x-powered-by");
 // The Sentry handler must be the first middleware in the stack
 expressApp.use(Sentry.Handlers.requestHandler());
-let httpsServer;
 const log = debugModule('demo-app');
 const warn = debugModule('demo-app:WARN');
 const err = debugModule('demo-app:ERROR');
@@ -67,7 +66,9 @@ const roomState = {
 // our http server needs to send 'index.html' and 'client-bundle.js'.
 // might as well just send everything in this directory ...
 //
-expressApp.use(express_1.default.static(__dirname));
+const dir = __dirname.replace("dist", "");
+console.log(dir);
+expressApp.use(express_1.default.static(dir));
 function createHttpsServer() {
     const https = require('https');
     const tls = {

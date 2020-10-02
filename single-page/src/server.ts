@@ -17,8 +17,6 @@ expressApp.disable("x-powered-by");
 // The Sentry handler must be the first middleware in the stack
 expressApp.use(Sentry.Handlers.requestHandler());
 
-let httpsServer;
-
 const log = debugModule('demo-app');
 const warn = debugModule('demo-app:WARN');
 const err = debugModule('demo-app:ERROR');
@@ -118,7 +116,8 @@ type Peer = {
 // might as well just send everything in this directory ...
 //
 
-expressApp.use(express.static(__dirname));
+const dir = __dirname.replace(/dist$/, "");
+expressApp.use(express.static(dir));
 
 function createHttpsServer() {
   const https = require('https');
