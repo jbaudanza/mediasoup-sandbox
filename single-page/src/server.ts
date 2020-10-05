@@ -5,6 +5,8 @@ import express from "express";
 import socketio from "socket.io";
 import * as Sentry from "@sentry/node";
 
+import * as protocol from "./protocol";
+
 Sentry.init({ dsn: process.env["SENTRY_DSN"] });
 
 const https = require('https');
@@ -90,7 +92,6 @@ const roomState: Room = {
 
 type Peer = {
   joinTs: number,
-  lastSeenTs: number,
   // TODO: I think this can be completed derived from the producers lists
   media: { [key: string]: Media },
   stats: { 
@@ -190,46 +191,446 @@ async function main() {
   io = require('socket.io')(server, { serveClient: false });
 
   io.on('connection', socket => {
-    function logSocket(msg: string) {
-      console.log(`[${new Date().toISOString()}] ${socket.id} ${msg}`)
-    }
-
-    logSocket("socketio connection");
-
     socket.emit("peers", {
       peers: roomState.peers,
       activeSpeaker: roomState.activeSpeaker
     });
 
-    socket.on('disconnect', () => {
-      logSocket(`socketio disconnect`);
-    });
+    setSocketHandlers(socket);
+  });
+}
 
-    socket.on('chat-message', (data: object) => {
-      logSocket('chat-message')
-      io.emit('chat-message', data);
-    });
+import type { GuardType } from "decoders";
+
+function setSocketHandlers(socket: SocketIO.Socket) {
+  function logSocket(msg: string) {
+    console.log(`[${new Date().toISOString()}] ${socket.id} ${msg}`)
+  }
+
+  logSocket("socketio connection");
+
+  socket.on('disconnect', () => {
+    logSocket(`socketio disconnect`);
   });
 
-  // periodically clean up peers that disconnected without sending us
-  // a final "beacon"
-  setInterval(() => {
-    let now = Date.now();
-    Object.entries(roomState.peers).forEach(([id, p]) => {
-      if ((now - p.lastSeenTs) > config.httpPeerStale) {
-        warn(`removing stale peer ${id}`);
-        closePeer(id);
-        updatePeers();
+  socket.on('chat-message', (data: object) => {
+    logSocket('chat-message')
+    io.emit('chat-message', data);
+  });
+
+  // --> /signaling/router-capabilities
+  //
+  //
+  socket.on('router-capabilities', withAsyncSocketHandler(async function() {
+    console.log("router-capabilities event")
+    return { routerRtpCapabilities: router.rtpCapabilities };
+  }));
+
+
+  // --> /signaling/join-as-new-peer
+  //
+  // adds the peer to the roomState data structure and creates a
+  // transport that the peer will use for receiving media. returns
+  // router rtpCapabilities for mediasoup-client device initialization
+  //
+  socket.on('join-as-new-peer', withAsyncSocketHandler(async function(data) {
+    const request = protocol.joinAsNewPeerRequest(data);
+    const peerId = request.peerId
+    log('join-as-new-peer', peerId);
+
+    roomState.peers[peerId] = {
+      joinTs: Date.now(),
+      media: {}, consumerLayers: {}, stats: { producers: {}, consumers: {}}
+    };
+
+    const response: GuardType<typeof protocol.joinAsNewPeerResponse> = { 
+      routerRtpCapabilities: router.rtpCapabilities
+    };
+
+    updatePeers();
+
+    setSocketHandlersForPeer(socket, peerId);
+
+    return response;
+  }));
+}
+
+function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
+  // --> /signaling/leave
+  //
+  // removes the peer from the roomState data structure and and closes
+  // all associated mediasoup objects
+  //
+  socket.on('leave', withAsyncSocketHandler(async function(data) {
+    log('leave', peerId);
+
+    await closePeer(peerId);
+    updatePeers();
+
+    return ({ left: true });
+  }));
+
+  socket.on('disconnect', async () => {
+    log('disconnect', peerId);
+    await closePeer(peerId);
+    updatePeers();
+  });
+
+  // --> /signaling/create-transport
+  //
+  // create a mediasoup transport object and send back info needed
+  // to create a transport object on the client side
+  //
+  socket.on('create-transport', withAsyncSocketHandler(async (data) => {
+    const request = protocol.createTransportRequest(data);
+    log('create-transport', peerId, request.direction);
+
+    let transport = await createWebRtcTransport({ peerId, direction: request.direction });
+    roomState.transports[transport.id] = transport;
+
+    let { id, iceParameters, iceCandidates, dtlsParameters } = transport;
+
+    const response: GuardType<typeof protocol.createTransportResponse> = {
+      transportOptions: { id, iceParameters, iceCandidates, dtlsParameters }
+    };
+
+    updatePeers();
+    return response;
+  }));
+
+  // --> /signaling/connect-transport
+  //
+  // called from inside a client's `transport.on('connect')` event
+  // handler.
+  //
+  socket.on('connect-transport', withAsyncSocketHandler(async (data) => {
+    const { transportId, dtlsParameters } = protocol.connectTransportRequest(data);
+    const transport = roomState.transports[transportId];
+
+    if (!transport) {
+      throw new Error(`connect-transport: server-side transport ${transportId} not found`);
+    }
+
+    log('connect-transport', peerId, transport.appData);
+
+    await transport.connect({ dtlsParameters });
+
+    updatePeers();
+
+    return { connected: true };
+  }));
+
+  // --> /signaling/close-transport
+  //
+  // called by a client that wants to close a single transport (for
+  // example, a client that is no longer sending any media).
+  //
+  socket.on('close-transport', withAsyncSocketHandler(async (data) => {
+    const { transportId } = protocol.closeTransportRequest(data);
+    const transport = roomState.transports[transportId];
+
+    if (!transport) {
+      throw new Error(`close-transport: server-side transport ${transportId} not found`);
+    }
+
+    log('close-transport', peerId, transport.appData);
+
+    await closeTransport(transport);
+
+    updatePeers();
+
+    return { closed: true };
+  }));
+
+  // --> /signaling/close-producer
+  //
+  // called by a client that is no longer sending a specific track
+  //
+  socket.on('close-producer', withAsyncSocketHandler(async (data) => {
+    const { producerId } = protocol.closeProducerRequest(data);
+    const producer = roomState.producers.find((p) => p.id === producerId);
+
+    if (!producer) {
+      throw new Error(`close-producer: server-side producer ${producerId} not found`);
+    }
+
+    log('close-producer', peerId, producer.appData);
+
+    await closeProducer(producer);
+
+    return { closed: true };
+
+    updatePeers();
+  }));
+
+  // --> /signaling/send-track
+  //
+  // called from inside a client's `transport.on('produce')` event handler.
+  //
+  socket.on('/send-track', withAsyncSocketHandler(async (data) => {
+    const { transportId, kind, rtpParameters, paused, appData } = protocol.sendTrackRequest(data);
+    const transport = roomState.transports[transportId];
+
+    if (!transport) {
+      throw new Error(`send-track: server-side transport ${transportId} not found`);
+    }
+
+    const producer = await transport.produce({
+      kind,
+      // @ts-ignore
+      rtpParameters,
+      paused,
+      appData: { ...appData, peerId, transportId }
+    });
+
+    // if our associated transport closes, close ourself, too
+    producer.on('transportclose', () => {
+      log('producer\'s transport closed', producer.id);
+      closeProducer(producer);
+    });
+
+    // monitor audio level of this producer. we call addProducer() here,
+    // but we don't ever need to call removeProducer() because the core
+    // AudioLevelObserver code automatically removes closed producers
+    if (producer.kind === 'audio') {
+      audioLevelObserver.addProducer({ producerId: producer.id });
+    }
+
+    roomState.producers.push(producer);
+    roomState.peers[peerId].media[appData.mediaTag] = {
+      paused,
+      // @ts-ignore
+      encodings: rtpParameters.encodings
+    };
+
+    updatePeers();
+
+    return { id: producer.id };
+  }));
+
+  // --> /signaling/recv-track
+  //
+  // create a mediasoup consumer object, hook it up to a producer here
+  // on the server side, and send back info needed to create a consumer
+  // object on the client side. always start consumers paused. client
+  // will request media to resume when the connection completes
+  //
+  socket.on('recv-track', withAsyncSocketHandler(async (data) => {
+    const { mediaPeerId, mediaTag, rtpCapabilities } = protocol.recvTrackRequest(data);
+
+    const producer = roomState.producers.find(
+      (p) => p.appData.mediaTag === mediaTag &&
+             p.appData.peerId === mediaPeerId
+    );
+
+    if (!producer) {
+      throw new Error('server-side producer for ' + `${mediaPeerId}:${mediaTag} not found`);
+    }
+
+    if (!router.canConsume({ producerId: producer.id, 
+      // @ts-ignore
+      rtpCapabilities })) {
+      throw new Error(`client cannot consume ${mediaPeerId}:${mediaTag}`);
+    }
+
+    const transport = Object.values(roomState.transports).find((t) =>
+      t.appData.peerId === peerId && t.appData.clientDirection === 'recv'
+    );
+
+    if (!transport) {
+      throw new Error(`server-side recv transport for ${peerId} not found`);
+    }
+
+    const consumer = await transport.consume({
+      producerId: producer.id,
+      // @ts-ignore
+      rtpCapabilities,
+      paused: true, // see note above about always starting paused
+      appData: { peerId, mediaPeerId, mediaTag }
+    });
+
+    // need both 'transportclose' and 'producerclose' event handlers,
+    // to make sure we close and clean up consumers in all
+    // circumstances
+    consumer.on('transportclose', () => {
+      log(`consumer's transport closed`, consumer.id);
+      closeConsumer(consumer);
+    });
+    consumer.on('producerclose', () => {
+      log(`consumer's producer closed`, consumer.id);
+      closeConsumer(consumer);
+    });
+
+    // stick this consumer in our list of consumers to keep track of,
+    // and create a data structure to track the client-relevant state
+    // of this consumer
+    roomState.consumers.push(consumer);
+    roomState.peers[peerId].consumerLayers[consumer.id] = {
+      currentLayer: null,
+      clientSelectedLayer: null
+    };
+
+    // update above data structure when layer changes.
+    consumer.on('layerschange', (layers) => {
+      log(`consumer layerschange ${mediaPeerId}->${peerId}`, mediaTag, layers);
+      if (roomState.peers[peerId] &&
+          roomState.peers[peerId].consumerLayers[consumer.id]) {
+        roomState.peers[peerId].consumerLayers[consumer.id]
+          .currentLayer = layers && layers.spatialLayer;
       }
     });
-  }, 1000);
 
-  // periodically update video stats we're sending to peers
-  setInterval(updatePeerStats, 3000);
+    const response: GuardType<typeof protocol.recvTrackResponse> = {
+      producerId: producer.id,
+      id: consumer.id,
+      kind: consumer.kind,
+      rtpParameters: consumer.rtpParameters,
+      type: consumer.type,
+      producerPaused: consumer.producerPaused
+    };
+
+    return response;
+  }));
+
+  // --> /signaling/pause-consumer
+  //
+  // called to pause receiving a track for a specific client
+  //
+  socket.on('pause-consumer', withAsyncSocketHandler(async (data) => {
+    const { consumerId } = protocol.pauseConsumerRequest(data);
+    const consumer = roomState.consumers.find((c) => c.id === consumerId);
+
+    if (!consumer) {
+      throw new Error(`pause-consumer: server-side consumer ${consumerId} not found`);
+      return;
+    }
+
+    log('pause-consumer', consumer.appData);
+
+    await consumer.pause();
+
+    return { paused: true };
+  }));
+
+  // --> /signaling/resume-consumer
+  //
+  // called to resume receiving a track for a specific client
+  //
+  socket.on('resume-consumer', withAsyncSocketHandler(async (data) => {
+    const { consumerId } = protocol.resumeConsumerRequest(data);
+    const consumer = roomState.consumers.find((c) => c.id === consumerId);
+
+    if (!consumer) {
+      throw new Error(`pause-consumer: server-side consumer ${consumerId} not found`);
+    }
+
+    log('resume-consumer', consumer.appData);
+
+    await consumer.resume();
+
+    return { resumed: true };
+  }));
+
+  // --> /signaling/close-consumer
+  //
+  // called to stop receiving a track for a specific client. close and
+  // clean up consumer object
+  //
+  socket.on('close-consumer', withAsyncSocketHandler(async (data) => {
+    const { consumerId } = protocol.closeConsumerRequest(data);
+    const consumer = roomState.consumers.find((c) => c.id === consumerId);
+
+    if (!consumer) {
+      throw new Error(`close-consumer: server-side consumer ${consumerId} not found`);
+    }
+
+    await closeConsumer(consumer);
+
+    return ({ closed: true });
+  }));
+
+  // --> /signaling/consumer-set-layers
+  //
+  // called to set the largest spatial layer that a specific client
+  // wants to receive
+  //
+  socket.on('consumer-set-layers', withAsyncSocketHandler(async (data) => {
+    const { consumerId, spatialLayer } = data;
+    const consumer = roomState.consumers.find((c) => c.id === consumerId);
+
+    if (!consumer) {
+      throw new Error(`consumer-set-layers: server-side consumer ${consumerId} not found`);
+    }
+
+    log('consumer-set-layers', spatialLayer, consumer.appData);
+
+    await consumer.setPreferredLayers({ spatialLayer });
+
+    return { layersSet: true };
+  }));
+
+  // --> /signaling/pause-producer
+  //
+  // called to stop sending a track from a specific client
+  // 
+  socket.on('pause-producer', withAsyncSocketHandler(async (data) => {
+    const { producerId } = protocol.pauseProducerRequest(data);
+    const producer = roomState.producers.find((p) => p.id === producerId);
+
+    if (!producer) {
+      throw new Error(`pause-producer: server-side producer ${producerId} not found`);
+    }
+
+    log('pause-producer', producer.appData);
+
+    await producer.pause();
+
+    roomState.peers[peerId].media[producer.appData.mediaTag].paused = true;
+
+    return { paused: true };
+  }));
+
+  // --> /signaling/resume-producer
+  //
+  // called to resume sending a track from a specific client
+  //
+  socket.on('resume-producer', withAsyncSocketHandler(async (data) => {
+    const { producerId } = protocol.resumeProducerRequest(data);
+    const producer = roomState.producers.find((p) => p.id === producerId);
+
+    if (!producer) {
+      throw new Error(`resume-producer: server-side producer ${producerId} not found`);
+    }
+
+    log('resume-producer', producer.appData);
+
+    await producer.resume();
+
+    roomState.peers[peerId].media[producer.appData.mediaTag].paused = false;
+
+    return ({ resumed: true });
+  }));
+
 }
 
 main().catch(console.error);
 
+function withAsyncSocketHandler(
+  handler: (data: any) => Promise<any>
+): (data: any, callback: (data: any) => void) => void {
+  return (data: any, callback: (data: any) => void) => {
+    handler(data).then((result: any) => {
+      callback(result);
+    }
+    ).catch((err: Error) => {
+
+      const eventId = Sentry.captureException(err);
+      console.warn(`Error raised (${eventId})`);
+      console.error(err);
+      callback({error: err.message, eventId: eventId})
+    });
+  }
+}
 
 //
 // start mediasoup with a single worker and router
@@ -282,75 +683,6 @@ async function startMediasoup() {
 // signaling endpoints. (sendBeacon can't set the Content-Type header)
 //
 expressApp.use(express.json({ type: '*/*' }));
-
-// --> /signaling/sync
-//
-// client polling endpoint. send back our 'peers' data structure and
-// 'activeSpeaker' info
-//
-expressApp.post('/signaling/sync', withAsyncHandler(async (req, res) => {
-  let { peerId } = req.body;
-
-  // make sure this peer is connected. if we've disconnected the
-  // peer because of a network outage we want the peer to know that
-  // happened, when/if it returns
-  if (!roomState.peers[peerId]) {
-    throw new Error('not connected');
-  }
-
-  // update our most-recently-seem timestamp -- we're not stale!
-  roomState.peers[peerId].lastSeenTs = Date.now();
-
-  res.send({
-    peers: roomState.peers,
-    activeSpeaker: roomState.activeSpeaker
-  });
-  
-}));
-
-// --> /signaling/join-as-new-peer
-//
-// adds the peer to the roomState data structure and creates a
-// transport that the peer will use for receiving media. returns
-// router rtpCapabilities for mediasoup-client device initialization
-//
-expressApp.post('/signaling/join-as-new-peer', withAsyncHandler(async (req, res) => {
-  let { peerId } = req.body,
-      now = Date.now();
-  log('join-as-new-peer', peerId);
-
-  roomState.peers[peerId] = {
-    joinTs: now,
-    lastSeenTs: now,
-    media: {}, consumerLayers: {}, stats: { producers: {}, consumers: {}}
-  };
-
-  res.send({ routerRtpCapabilities: router.rtpCapabilities });
-
-  updatePeers();
-}));
-
-// --> /signaling/router-capabilities
-//
-//
-expressApp.post('/signaling/router-capabilities', withAsyncHandler(async (req, res) => {
-  res.send({ routerRtpCapabilities: router.rtpCapabilities });
-}));
-
-// --> /signaling/leave
-//
-// removes the peer from the roomState data structure and and closes
-// all associated mediasoup objects
-//
-expressApp.post('/signaling/leave', withAsyncHandler(async (req, res) => {
-  let { peerId } = req.body;
-  log('leave', peerId);
-
-  await closePeer(peerId);
-  res.send({ left: true });
-
-  updatePeers();
-}));
 
 function closePeer(peerId: string) {
   log('closing peer', peerId);
@@ -408,27 +740,6 @@ async function closeConsumer(consumer: Consumer) {
   }
 }
 
-
-// --> /signaling/create-transport
-//
-// create a mediasoup transport object and send back info needed
-// to create a transport object on the client side
-//
-expressApp.post('/signaling/create-transport', withAsyncHandler(async (req, res) => {
-  let { peerId, direction } = req.body;
-  log('create-transport', peerId, direction);
-
-  let transport = await createWebRtcTransport({ peerId, direction });
-  roomState.transports[transport.id] = transport;
-
-  let { id, iceParameters, iceCandidates, dtlsParameters } = transport;
-  res.send({
-    transportOptions: { id, iceParameters, iceCandidates, dtlsParameters }
-  });
-
-  updatePeers();
-}));
-
 async function createWebRtcTransport(params: { peerId: string, direction: string }) {
   const { peerId, direction } = params;
   const {
@@ -447,341 +758,6 @@ async function createWebRtcTransport(params: { peerId: string, direction: string
 
   return transport;
 }
-
-// --> /signaling/connect-transport
-//
-// called from inside a client's `transport.on('connect')` event
-// handler.
-//
-expressApp.post('/signaling/connect-transport', withAsyncHandler(async (req, res) => {
-  let { peerId, transportId, dtlsParameters } = req.body,
-      transport = roomState.transports[transportId];
-
-  if (!transport) {
-    err(`connect-transport: server-side transport ${transportId} not found`);
-    res.send({ error: `server-side transport ${transportId} not found` });
-    return;
-  }
-
-  log('connect-transport', peerId, transport.appData);
-
-  await transport.connect({ dtlsParameters });
-  res.send({ connected: true });
-
-  updatePeers();
-}));
-
-// --> /signaling/close-transport
-//
-// called by a client that wants to close a single transport (for
-// example, a client that is no longer sending any media).
-//
-expressApp.post('/signaling/close-transport', withAsyncHandler(async (req, res) => {
-  let { peerId, transportId } = req.body,
-      transport = roomState.transports[transportId];
-
-  if (!transport) {
-    err(`close-transport: server-side transport ${transportId} not found`);
-    res.send({ error: `server-side transport ${transportId} not found` });
-    return;
-  }
-
-  log('close-transport', peerId, transport.appData);
-
-  await closeTransport(transport);
-  res.send({ closed: true });
-
-  updatePeers();
-}));
-
-// --> /signaling/close-producer
-//
-// called by a client that is no longer sending a specific track
-//
-expressApp.post('/signaling/close-producer', withAsyncHandler(async (req, res) => {
-  let { peerId, producerId } = req.body,
-      producer = roomState.producers.find((p) => p.id === producerId);
-
-  if (!producer) {
-    err(`close-producer: server-side producer ${producerId} not found`);
-    res.send({ error: `server-side producer ${producerId} not found` });
-    return;
-  }
-
-  log('close-producer', peerId, producer.appData);
-
-  await closeProducer(producer);
-  res.send({ closed: true });
-
-  updatePeers();
-}));
-
-
-// --> /signaling/send-track
-//
-// called from inside a client's `transport.on('produce')` event handler.
-//
-expressApp.post('/signaling/send-track', withAsyncHandler(async (req, res) => {
-  let { peerId, transportId, kind, rtpParameters,
-        paused=false, appData } = req.body,
-      transport = roomState.transports[transportId];
-
-  if (!transport) {
-    err(`send-track: server-side transport ${transportId} not found`);
-    res.send({ error: `server-side transport ${transportId} not found`});
-    return;
-  }
-
-  let producer = await transport.produce({
-    kind,
-    rtpParameters,
-    paused,
-    appData: { ...appData, peerId, transportId }
-  });
-
-  // if our associated transport closes, close ourself, too
-  producer.on('transportclose', () => {
-    log('producer\'s transport closed', producer.id);
-    closeProducer(producer);
-  });
-
-  // monitor audio level of this producer. we call addProducer() here,
-  // but we don't ever need to call removeProducer() because the core
-  // AudioLevelObserver code automatically removes closed producers
-  if (producer.kind === 'audio') {
-    audioLevelObserver.addProducer({ producerId: producer.id });
-  }
-
-  roomState.producers.push(producer);
-  roomState.peers[peerId].media[appData.mediaTag] = {
-    paused,
-    encodings: rtpParameters.encodings
-  };
-
-  res.send({ id: producer.id });
-
-  updatePeers();
-}));
-
-// --> /signaling/recv-track
-//
-// create a mediasoup consumer object, hook it up to a producer here
-// on the server side, and send back info needed to create a consumer
-// object on the client side. always start consumers paused. client
-// will request media to resume when the connection completes
-//
-expressApp.post('/signaling/recv-track', withAsyncHandler(async (req, res) => {
-  let { peerId, mediaPeerId, mediaTag, rtpCapabilities } = req.body;
-
-  let producer = roomState.producers.find(
-    (p) => p.appData.mediaTag === mediaTag &&
-           p.appData.peerId === mediaPeerId
-  );
-
-  if (!producer) {
-    let msg = 'server-side producer for ' +
-                `${mediaPeerId}:${mediaTag} not found`;
-    err('recv-track: ' + msg);
-    res.send({ error: msg });
-    return;
-  }
-
-  if (!router.canConsume({ producerId: producer.id,
-                           rtpCapabilities })) {
-    let msg = `client cannot consume ${mediaPeerId}:${mediaTag}`;
-    err(`recv-track: ${peerId} ${msg}`);
-    res.send({ error: msg });
-    return;
-  }
-
-  let transport = Object.values(roomState.transports).find((t) =>
-    t.appData.peerId === peerId && t.appData.clientDirection === 'recv'
-  );
-
-  if (!transport) {
-    let msg = `server-side recv transport for ${peerId} not found`;
-    err('recv-track: ' + msg);
-    res.send({ error: msg });
-    return;
-  }
-
-  let consumer = await transport.consume({
-    producerId: producer.id,
-    rtpCapabilities,
-    paused: true, // see note above about always starting paused
-    appData: { peerId, mediaPeerId, mediaTag }
-  });
-
-  // need both 'transportclose' and 'producerclose' event handlers,
-  // to make sure we close and clean up consumers in all
-  // circumstances
-  consumer.on('transportclose', () => {
-    log(`consumer's transport closed`, consumer.id);
-    closeConsumer(consumer);
-  });
-  consumer.on('producerclose', () => {
-    log(`consumer's producer closed`, consumer.id);
-    closeConsumer(consumer);
-  });
-
-  // stick this consumer in our list of consumers to keep track of,
-  // and create a data structure to track the client-relevant state
-  // of this consumer
-  roomState.consumers.push(consumer);
-  roomState.peers[peerId].consumerLayers[consumer.id] = {
-    currentLayer: null,
-    clientSelectedLayer: null
-  };
-
-  // update above data structure when layer changes.
-  consumer.on('layerschange', (layers) => {
-    log(`consumer layerschange ${mediaPeerId}->${peerId}`, mediaTag, layers);
-    if (roomState.peers[peerId] &&
-        roomState.peers[peerId].consumerLayers[consumer.id]) {
-      roomState.peers[peerId].consumerLayers[consumer.id]
-        .currentLayer = layers && layers.spatialLayer;
-    }
-  });
-
-  res.send({
-    producerId: producer.id,
-    id: consumer.id,
-    kind: consumer.kind,
-    rtpParameters: consumer.rtpParameters,
-    type: consumer.type,
-    producerPaused: consumer.producerPaused
-  });
-}));
-
-// --> /signaling/pause-consumer
-//
-// called to pause receiving a track for a specific client
-//
-expressApp.post('/signaling/pause-consumer', withAsyncHandler(async (req, res) => {
-  let { peerId, consumerId } = req.body,
-      consumer = roomState.consumers.find((c) => c.id === consumerId);
-
-  if (!consumer) {
-    err(`pause-consumer: server-side consumer ${consumerId} not found`);
-    res.send({ error: `server-side producer ${consumerId} not found` });
-    return;
-  }
-
-  log('pause-consumer', consumer.appData);
-
-  await consumer.pause();
-
-  res.send({ paused: true});
-}));
-
-// --> /signaling/resume-consumer
-//
-// called to resume receiving a track for a specific client
-//
-expressApp.post('/signaling/resume-consumer', withAsyncHandler(async (req, res) => {
-  let { peerId, consumerId } = req.body,
-      consumer = roomState.consumers.find((c) => c.id === consumerId);
-
-  if (!consumer) {
-    err(`pause-consumer: server-side consumer ${consumerId} not found`);
-    res.send({ error: `server-side consumer ${consumerId} not found` });
-    return;
-  }
-
-  log('resume-consumer', consumer.appData);
-
-  await consumer.resume();
-
-  res.send({ resumed: true });
-}));
-
-// --> /signalign/close-consumer
-//
-// called to stop receiving a track for a specific client. close and
-// clean up consumer object
-//
-expressApp.post('/signaling/close-consumer', withAsyncHandler(async (req, res) => {
-  let { peerId, consumerId } = req.body,
-      consumer = roomState.consumers.find((c) => c.id === consumerId);
-
-  if (!consumer) {
-    err(`close-consumer: server-side consumer ${consumerId} not found`);
-    res.send({ error: `server-side consumer ${consumerId} not found` });
-    return;
-  }
-
-  await closeConsumer(consumer);
-
-  res.send({ closed: true });
-}));
-
-// --> /signaling/consumer-set-layers
-//
-// called to set the largest spatial layer that a specific client
-// wants to receive
-//
-expressApp.post('/signaling/consumer-set-layers', withAsyncHandler(async (req, res) => {
-  let { peerId, consumerId, spatialLayer } = req.body,
-      consumer = roomState.consumers.find((c) => c.id === consumerId);
-
-  if (!consumer) {
-    err(`consumer-set-layers: server-side consumer ${consumerId} not found`);
-    res.send({ error: `server-side consumer ${consumerId} not found` });
-    return;
-  }
-
-  log('consumer-set-layers', spatialLayer, consumer.appData);
-
-  await consumer.setPreferredLayers({ spatialLayer });
-
-  res.send({ layersSet: true });
-}));
-
-// --> /signaling/pause-producer
-//
-// called to stop sending a track from a specific client
-//
-expressApp.post('/signaling/pause-producer', withAsyncHandler(async (req, res) => {
-  let { peerId, producerId } = req.body,
-      producer = roomState.producers.find((p) => p.id === producerId);
-
-  if (!producer) {
-    err(`pause-producer: server-side producer ${producerId} not found`);
-    res.send({ error: `server-side producer ${producerId} not found` });
-    return;
-  }
-
-  log('pause-producer', producer.appData);
-
-  await producer.pause();
-
-  roomState.peers[peerId].media[producer.appData.mediaTag].paused = true;
-
-  res.send({ paused: true });
-}));
-
-// --> /signaling/resume-producer
-//
-// called to resume sending a track from a specific client
-//
-expressApp.post('/signaling/resume-producer', withAsyncHandler(async (req, res) => {
-  let { peerId, producerId } = req.body,
-      producer = roomState.producers.find((p) => p.id === producerId);
-
-  if (!producer) {
-    err(`resume-producer: server-side producer ${producerId} not found`);
-    res.send({ error: `server-side producer ${producerId} not found` });
-    return;
-  }
-
-  log('resume-producer', producer.appData);
-
-  await producer.resume();
-
-  roomState.peers[peerId].media[producer.appData.mediaTag].paused = false;
-
-  res.send({ resumed: true });
-}));
 
 expressApp.use(notFoundHandler);
 expressApp.use(errorHandler);

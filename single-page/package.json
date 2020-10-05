@@ -12,6 +12,7 @@
   "license": "ISC",
   "dependencies": {
     "@sentry/node": "^5.24.2",
+    "decoders": "^1.23.2",
     "deep-equal": "^1.0.1",
     "express": "^4.17.1",
     "mediasoup": "^3.1.5",
