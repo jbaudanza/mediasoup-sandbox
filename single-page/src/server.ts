@@ -20,8 +20,6 @@ expressApp.disable("x-powered-by");
 expressApp.use(Sentry.Handlers.requestHandler());
 
 const log = debugModule('demo-app');
-const warn = debugModule('demo-app:WARN');
-const err = debugModule('demo-app:ERROR');
 
 // TODO: Is this the most graceful way?
 import type { Consumer } from "mediasoup/lib/Consumer";
@@ -29,19 +27,15 @@ import type { Producer } from "mediasoup/lib/Producer";
 import type { Transport } from "mediasoup/lib/Transport";
 import type { Router } from "mediasoup/lib/Router";
 import type { Worker } from "mediasoup/lib/Worker";
-import type { AudioLevelObserver } from "mediasoup/lib/AudioLevelObserver";
 
 import type { Socket } from "socket.io";
 
 // one mediasoup worker and router
 //
-let worker: Worker, 
-  router: Router, 
-  audioLevelObserver: AudioLevelObserver;
+let worker: Worker, router: Router;
 
 type Room = {
   peers: { [key: string]: Peer },
-  activeSpeaker: { producerId: string | null, volume: number | null, peerId: string | null },
   transports: {[key: string]: Transport },
   producers: Array<Producer>,
   consumers: Array<Consumer>
@@ -66,20 +60,17 @@ type ConsumerStats = {
   score: number
 };
 
-
-//
-// and one "room" ...
-//
-const roomState: Room = {
+const emptyRoom = Object.freeze({
   // external
   peers: {},
-  activeSpeaker: { producerId: null, volume: null, peerId: null },
   // internal
   transports: {},
   producers: [],
   consumers: []
-};
+});
 
+const roomState: { [roomId: string]: Room } = {};
+  
 //
 // for each peer that connects, we keep a table of peers and what
 // tracks are being sent and received. we also need to know the last
@@ -87,7 +78,7 @@ const roomState: Room = {
 // network issues.
 //
 // for this simple demo, each client polls the server at 1hz, and we
-// just send this roomState.peers data structure as our answer to each
+// just send this room.peers data structure as our answer to each
 // poll request.
 
 type Peer = {
@@ -138,10 +129,9 @@ function createHttpServer() {
 
 let io: Socket;
 
-function updatePeers() {
-  io.emit("peers", {
-    peers: roomState.peers,
-    activeSpeaker: roomState.activeSpeaker
+function updatePeers(roomId: string) {
+  io.to(`room:${roomId}`).emit("peers", {
+    peers: roomState[roomId].peers
   });
 }
 
@@ -160,7 +150,7 @@ function withAsyncHandler(handler: express.Handler): express.Handler {
 async function main() {
   // start mediasoup
   console.log('starting mediasoup');
-  ({ worker, router, audioLevelObserver } = await startMediasoup());
+  ({ worker, router } = await startMediasoup());
 
   // start https server, falling back to http if https fails
   console.log('starting express');
@@ -191,11 +181,6 @@ async function main() {
   io = require('socket.io')(server, { serveClient: false });
 
   io.on('connection', socket => {
-    socket.emit("peers", {
-      peers: roomState.peers,
-      activeSpeaker: roomState.activeSpeaker
-    });
-
     setSocketHandlers(socket);
   });
 }
@@ -222,7 +207,6 @@ function setSocketHandlers(socket: SocketIO.Socket) {
   //
   //
   socket.on('router-capabilities', withAsyncSocketHandler(async function() {
-    console.log("router-capabilities event")
     return { routerRtpCapabilities: router.rtpCapabilities };
   }));
 
@@ -235,10 +219,14 @@ function setSocketHandlers(socket: SocketIO.Socket) {
   //
   socket.on('join-as-new-peer', withAsyncSocketHandler(async function(data) {
     const request = protocol.joinAsNewPeerRequest(data);
-    const peerId = request.peerId
-    log('join-as-new-peer', peerId);
+    const {peerId, roomId} = request;
+    console.log('join-as-new-peer', peerId, roomId);
 
-    roomState.peers[peerId] = {
+    if (!(roomId in roomState)) {
+      roomState[roomId] = Object.assign({}, emptyRoom);
+    }
+
+    roomState[roomId].peers[peerId] = {
       joinTs: Date.now(),
       media: {}, consumerLayers: {}, stats: { producers: {}, consumers: {}}
     };
@@ -247,15 +235,17 @@ function setSocketHandlers(socket: SocketIO.Socket) {
       routerRtpCapabilities: router.rtpCapabilities
     };
 
-    updatePeers();
+    updatePeers(roomId);
 
-    setSocketHandlersForPeer(socket, peerId);
+    setSocketHandlersForPeer(socket, peerId, roomId);
+
+    socket.join(`room:${roomId}`);
 
     return response;
   }));
 }
 
-function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
+function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string, roomId: string) {
   // --> /signaling/leave
   //
   // removes the peer from the roomState data structure and and closes
@@ -264,16 +254,16 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
   socket.on('leave', withAsyncSocketHandler(async function(data) {
     log('leave', peerId);
 
-    await closePeer(peerId);
-    updatePeers();
+    await closePeer(roomId, peerId);
+    updatePeers(roomId);
 
     return ({ left: true });
   }));
 
   socket.on('disconnect', async () => {
     log('disconnect', peerId);
-    await closePeer(peerId);
-    updatePeers();
+    await closePeer(roomId, peerId);
+    updatePeers(roomId);
   });
 
   // --> /signaling/create-transport
@@ -286,7 +276,11 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
     log('create-transport', peerId, request.direction);
 
     let transport = await createWebRtcTransport({ peerId, direction: request.direction });
-    roomState.transports[transport.id] = transport;
+    if (roomId in roomState) {
+      roomState[roomId].transports[transport.id] = transport;
+    } else {
+      console.warn(`create-transport unable to find room ${roomId}`);
+    }
 
     let { id, iceParameters, iceCandidates, dtlsParameters } = transport;
 
@@ -294,7 +288,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
       transportOptions: { id, iceParameters, iceCandidates, dtlsParameters }
     };
 
-    updatePeers();
+    updatePeers(roomId);
     return response;
   }));
 
@@ -305,9 +299,13 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
   //
   socket.on('connect-transport', withAsyncSocketHandler(async (data) => {
     const { transportId, dtlsParameters } = protocol.connectTransportRequest(data);
-    const transport = roomState.transports[transportId];
+  
+    if (!(roomId in roomState)) {
+      throw new Error(`No room ${roomId}`);
+    }
 
-    if (!transport) {
+    const transport = roomState[roomId].transports[transportId];
+    if (transport == null) {
       throw new Error(`connect-transport: server-side transport ${transportId} not found`);
     }
 
@@ -315,7 +313,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
 
     await transport.connect({ dtlsParameters });
 
-    updatePeers();
+    updatePeers(roomId);
 
     return { connected: true };
   }));
@@ -327,17 +325,22 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
   //
   socket.on('close-transport', withAsyncSocketHandler(async (data) => {
     const { transportId } = protocol.closeTransportRequest(data);
-    const transport = roomState.transports[transportId];
 
-    if (!transport) {
+    if (!(roomId in roomState)) {
+      throw new Error(`No room ${roomId}`);
+    }
+
+    const transport = roomState[roomId].transports[transportId];
+
+    if (roomState[roomId].transports[transportId]) {
       throw new Error(`close-transport: server-side transport ${transportId} not found`);
     }
 
     log('close-transport', peerId, transport.appData);
 
-    await closeTransport(transport);
+    await closeTransport(roomId, transport);
 
-    updatePeers();
+    updatePeers(roomId);
 
     return { closed: true };
   }));
@@ -348,7 +351,12 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
   //
   socket.on('close-producer', withAsyncSocketHandler(async (data) => {
     const { producerId } = protocol.closeProducerRequest(data);
-    const producer = roomState.producers.find((p) => p.id === producerId);
+
+    if (!(roomId in roomState)) {
+      throw new Error(`No room ${roomId}`);
+    }
+
+    const producer = roomState[roomId].producers.find((p) => p.id === producerId);
 
     if (!producer) {
       throw new Error(`close-producer: server-side producer ${producerId} not found`);
@@ -356,11 +364,11 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
 
     log('close-producer', peerId, producer.appData);
 
-    await closeProducer(producer);
+    await closeProducer(roomId, producer);
 
     return { closed: true };
 
-    updatePeers();
+    updatePeers(roomId);
   }));
 
   // --> /signaling/send-track
@@ -369,7 +377,12 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
   //
   socket.on('/send-track', withAsyncSocketHandler(async (data) => {
     const { transportId, kind, rtpParameters, paused, appData } = protocol.sendTrackRequest(data);
-    const transport = roomState.transports[transportId];
+
+    if (!(roomId in roomState)) {
+      throw new Error(`No room ${roomId}`);
+    }
+
+    const transport = roomState[roomId].transports[transportId];
 
     if (!transport) {
       throw new Error(`send-track: server-side transport ${transportId} not found`);
@@ -386,24 +399,17 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
     // if our associated transport closes, close ourself, too
     producer.on('transportclose', () => {
       log('producer\'s transport closed', producer.id);
-      closeProducer(producer);
+      closeProducer(roomId, producer);
     });
 
-    // monitor audio level of this producer. we call addProducer() here,
-    // but we don't ever need to call removeProducer() because the core
-    // AudioLevelObserver code automatically removes closed producers
-    if (producer.kind === 'audio') {
-      audioLevelObserver.addProducer({ producerId: producer.id });
-    }
-
-    roomState.producers.push(producer);
-    roomState.peers[peerId].media[appData.mediaTag] = {
+    roomState[roomId].producers.push(producer);
+    roomState[roomId].peers[peerId].media[appData.mediaTag] = {
       paused,
       // @ts-ignore
       encodings: rtpParameters.encodings
     };
 
-    updatePeers();
+    updatePeers(roomId);
 
     return { id: producer.id };
   }));
@@ -418,7 +424,11 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
   socket.on('recv-track', withAsyncSocketHandler(async (data) => {
     const { mediaPeerId, mediaTag, rtpCapabilities } = protocol.recvTrackRequest(data);
 
-    const producer = roomState.producers.find(
+    if (!(roomId in roomState)) {
+      throw new Error(`No room ${roomId}`);
+    }
+
+    const producer = roomState[roomId].producers.find(
       (p) => p.appData.mediaTag === mediaTag &&
              p.appData.peerId === mediaPeerId
     );
@@ -433,7 +443,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
       throw new Error(`client cannot consume ${mediaPeerId}:${mediaTag}`);
     }
 
-    const transport = Object.values(roomState.transports).find((t) =>
+    const transport = Object.values(roomState[roomId].transports).find((t) =>
       t.appData.peerId === peerId && t.appData.clientDirection === 'recv'
     );
 
@@ -454,18 +464,18 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
     // circumstances
     consumer.on('transportclose', () => {
       log(`consumer's transport closed`, consumer.id);
-      closeConsumer(consumer);
+      closeConsumer(roomId, consumer);
     });
     consumer.on('producerclose', () => {
       log(`consumer's producer closed`, consumer.id);
-      closeConsumer(consumer);
+      closeConsumer(roomId, consumer);
     });
 
     // stick this consumer in our list of consumers to keep track of,
     // and create a data structure to track the client-relevant state
     // of this consumer
-    roomState.consumers.push(consumer);
-    roomState.peers[peerId].consumerLayers[consumer.id] = {
+    roomState[roomId].consumers.push(consumer);
+    roomState[roomId].peers[peerId].consumerLayers[consumer.id] = {
       currentLayer: null,
       clientSelectedLayer: null
     };
@@ -473,9 +483,9 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
     // update above data structure when layer changes.
     consumer.on('layerschange', (layers) => {
       log(`consumer layerschange ${mediaPeerId}->${peerId}`, mediaTag, layers);
-      if (roomState.peers[peerId] &&
-          roomState.peers[peerId].consumerLayers[consumer.id]) {
-        roomState.peers[peerId].consumerLayers[consumer.id]
+      if (roomState[roomId].peers[peerId] &&
+          roomState[roomId].peers[peerId].consumerLayers[consumer.id]) {
+        roomState[roomId].peers[peerId].consumerLayers[consumer.id]
           .currentLayer = layers && layers.spatialLayer;
       }
     });
@@ -498,7 +508,12 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
   //
   socket.on('pause-consumer', withAsyncSocketHandler(async (data) => {
     const { consumerId } = protocol.pauseConsumerRequest(data);
-    const consumer = roomState.consumers.find((c) => c.id === consumerId);
+
+    if (!(roomId in roomState)) {
+      throw new Error(`No room ${roomId}`);
+    }
+
+    const consumer = roomState[roomId].consumers.find((c) => c.id === consumerId);
 
     if (!consumer) {
       throw new Error(`pause-consumer: server-side consumer ${consumerId} not found`);
@@ -518,7 +533,12 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
   //
   socket.on('resume-consumer', withAsyncSocketHandler(async (data) => {
     const { consumerId } = protocol.resumeConsumerRequest(data);
-    const consumer = roomState.consumers.find((c) => c.id === consumerId);
+
+    if (!(roomId in roomState)) {
+      throw new Error(`No room ${roomId}`);
+    }
+
+    const consumer = roomState[roomId].consumers.find((c) => c.id === consumerId);
 
     if (!consumer) {
       throw new Error(`pause-consumer: server-side consumer ${consumerId} not found`);
@@ -538,13 +558,18 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
   //
   socket.on('close-consumer', withAsyncSocketHandler(async (data) => {
     const { consumerId } = protocol.closeConsumerRequest(data);
-    const consumer = roomState.consumers.find((c) => c.id === consumerId);
+
+    if (!(roomId in roomState)) {
+      throw new Error(`No room ${roomId}`);
+    }
+
+    const consumer = roomState[roomId].consumers.find((c) => c.id === consumerId);
 
     if (!consumer) {
       throw new Error(`close-consumer: server-side consumer ${consumerId} not found`);
     }
 
-    await closeConsumer(consumer);
+    await closeConsumer(roomId, consumer);
 
     return ({ closed: true });
   }));
@@ -556,7 +581,12 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
   //
   socket.on('consumer-set-layers', withAsyncSocketHandler(async (data) => {
     const { consumerId, spatialLayer } = data;
-    const consumer = roomState.consumers.find((c) => c.id === consumerId);
+
+    if (!(roomId in roomState)) {
+      throw new Error(`No room ${roomId}`);
+    }
+
+    const consumer = roomState[roomId].consumers.find((c) => c.id === consumerId);
 
     if (!consumer) {
       throw new Error(`consumer-set-layers: server-side consumer ${consumerId} not found`);
@@ -575,7 +605,12 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
   // 
   socket.on('pause-producer', withAsyncSocketHandler(async (data) => {
     const { producerId } = protocol.pauseProducerRequest(data);
-    const producer = roomState.producers.find((p) => p.id === producerId);
+
+    if (!(roomId in roomState)) {
+      throw new Error(`No room ${roomId}`);
+    }
+
+    const producer = roomState[roomId].producers.find((p) => p.id === producerId);
 
     if (!producer) {
       throw new Error(`pause-producer: server-side producer ${producerId} not found`);
@@ -585,7 +620,11 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
 
     await producer.pause();
 
-    roomState.peers[peerId].media[producer.appData.mediaTag].paused = true;
+    if (roomState[roomId]) {
+      roomState[roomId].peers[peerId].media[producer.appData.mediaTag].paused = true;
+    } else {
+      console.warn(`pause-producer unable to find roomId ${roomId}`);
+    }
 
     return { paused: true };
   }));
@@ -596,7 +635,12 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
   //
   socket.on('resume-producer', withAsyncSocketHandler(async (data) => {
     const { producerId } = protocol.resumeProducerRequest(data);
-    const producer = roomState.producers.find((p) => p.id === producerId);
+
+    if (!(roomId in roomState)) {
+      throw new Error(`No room ${roomId}`);
+    }
+
+    const producer = roomState[roomId].producers.find((p) => p.id === producerId);
 
     if (!producer) {
       throw new Error(`resume-producer: server-side producer ${producerId} not found`);
@@ -606,7 +650,11 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string) {
 
     await producer.resume();
 
-    roomState.peers[peerId].media[producer.appData.mediaTag].paused = false;
+    if (roomState[roomId]) {
+      roomState[roomId].peers[peerId].media[producer.appData.mediaTag].paused = false;
+    } else {
+      console.warn(`resume-producer unable to find roomId ${roomId}`);
+    }
 
     return ({ resumed: true });
   }));
@@ -623,7 +671,6 @@ function withAsyncSocketHandler(
       callback(result);
     }
     ).catch((err: Error) => {
-
       const eventId = Sentry.captureException(err);
       console.warn(`Error raised (${eventId})`);
       console.error(err);
@@ -652,26 +699,7 @@ async function startMediasoup() {
   const mediaCodecs = config.mediasoup.router.mediaCodecs;
   const router = await worker.createRouter({ mediaCodecs });
 
-  // audioLevelObserver for signaling active speaker
-  //
-  const audioLevelObserver = await router.createAudioLevelObserver({
-		interval: 800
-	});
-  audioLevelObserver.on('volumes', (volumes) => {
-    const { producer, volume } = volumes[0];
-    log('audio-level volumes event', producer.appData.peerId, volume);
-    roomState.activeSpeaker.producerId = producer.id;
-    roomState.activeSpeaker.volume = volume;
-    roomState.activeSpeaker.peerId = producer.appData.peerId;
-  });
-  audioLevelObserver.on('silence', () => {
-    log('audio-level silence event');
-    roomState.activeSpeaker.producerId = null;
-    roomState.activeSpeaker.volume = null;
-    roomState.activeSpeaker.peerId = null;
-  });
-
-  return { worker, router, audioLevelObserver };
+  return { worker, router };
 }
 
 //
@@ -684,59 +712,72 @@ async function startMediasoup() {
 //
 expressApp.use(express.json({ type: '*/*' }));
 
-function closePeer(peerId: string) {
+function closePeer(roomId: string, peerId: string) {
   log('closing peer', peerId);
-  for (let [id, transport] of Object.entries(roomState.transports)) {
-    if (transport.appData.peerId === peerId) {
-      closeTransport(transport);
+  const room = roomState[roomId];
+  if (room == null) {
+    console.log(`closePeer unable to find room ${roomId}`);
+  } else {
+    for (let [id, transport] of Object.entries(room.transports)) {
+      if (transport.appData.peerId === peerId) {
+        try {
+          closeTransport(roomId, transport);
+        } catch(e) {
+          console.error(e);
+        }
+      }
     }
-  }
-  delete roomState.peers[peerId];
-}
-
-async function closeTransport(transport: Transport) {
-  try {
-    log('closing transport', transport.id, transport.appData);
-
-    // our producer and consumer event handlers will take care of
-    // calling closeProducer() and closeConsumer() on all the producers
-    // and consumers associated with this transport
-    await transport.close();
-
-    // so all we need to do, after we call transport.close(), is update
-    // our roomState data structure
-    delete roomState.transports[transport.id];
-  } catch (e) {
-    err(e);
+    delete room.peers[peerId];
   }
 }
 
-async function closeProducer(producer: Producer) {
+async function closeTransport(roomId: string, transport: Transport) {
+  log('closing transport', transport.id, transport.appData);
+
+  // our producer and consumer event handlers will take care of
+  // calling closeProducer() and closeConsumer() on all the producers
+  // and consumers associated with this transport
+  await transport.close();
+
+  // so all we need to do, after we call transport.close(), is update
+  // our roomState data structure
+  delete roomState[roomId].transports[transport.id];
+}
+
+async function closeProducer(roomId: string, producer: Producer) {
   log('closing producer', producer.id, producer.appData);
   await producer.close();
 
-  // remove this producer from our roomState.producers list
-  roomState.producers = roomState.producers
-    .filter((p) => p.id !== producer.id);
+  const room = roomState[roomId];
+  if (room == null) {
+    console.warn(`closeProducer unable to find roomId ${roomId}`);
+  } else {
+    // remove this producer from our room.producers list
+    room.producers = room.producers.filter((p) => p.id !== producer.id);
 
-  // remove this track's info from our roomState...mediaTag bookkeeping
-  if (roomState.peers[producer.appData.peerId]) {
-    delete (roomState.peers[producer.appData.peerId]
-            .media[producer.appData.mediaTag]);
+    // remove this track's info from our room...mediaTag bookkeeping
+    if (room.peers[producer.appData.peerId]) {
+      delete (room.peers[producer.appData.peerId]
+              .media[producer.appData.mediaTag]);
+    }
   }
-
 }
 
-async function closeConsumer(consumer: Consumer) {
+async function closeConsumer(roomId: string, consumer: Consumer) {
   log('closing consumer', consumer.id, consumer.appData);
   await consumer.close();
 
-  // remove this consumer from our roomState.consumers list
-  roomState.consumers = roomState.consumers.filter((c) => c.id !== consumer.id);
+  const room = roomState[roomId];
+  if (room == null) {
+    console.warn(`closeConsumer unable to find roomId ${roomId}`);
+  } else {
+    // remove this consumer from our room.consumers list
+    room.consumers = room.consumers.filter((c) => c.id !== consumer.id);
 
-  // remove layer info from from our roomState...consumerLayers bookkeeping
-  if (roomState.peers[consumer.appData.peerId]) {
-    delete roomState.peers[consumer.appData.peerId].consumerLayers[consumer.id];
+    // remove layer info from from our room...consumerLayers bookkeeping
+    if (room.peers[consumer.appData.peerId]) {
+      delete room.peers[consumer.appData.peerId].consumerLayers[consumer.id];
+    }
   }
 }
 
@@ -837,15 +878,15 @@ function sendInternalServerError(
 // stats
 //
 
-async function updatePeerStats() {
-  for (let producer of roomState.producers) {
+async function updatePeerStats(roomId: string) {
+  for (let producer of roomState[roomId].producers) {
     if (producer.kind !== 'video') {
       continue;
     }
     try {
       let stats = await producer.getStats(),
           peerId = producer.appData.peerId;
-      roomState.peers[peerId].stats.producers[producer.id] = stats.map((s) => ({
+      roomState[roomId].peers[peerId].stats.producers[producer.id] = stats.map((s) => ({
         bitrate: s.bitrate,
         fractionLost: s.fractionLost,
         jitter: s.jitter,
@@ -853,25 +894,25 @@ async function updatePeerStats() {
         rid: s.rid
       }));
     } catch (e) {
-      warn('error while updating producer stats', e);
+      console.warn('error while updating producer stats', e);
     }
   }
 
-  for (let consumer of roomState.consumers) {
+  for (let consumer of roomState[roomId].consumers) {
     try {
       let stats = (await consumer.getStats())
                     .find((s) => s.type === 'outbound-rtp'),
           peerId = consumer.appData.peerId;
-      if (!stats || !roomState.peers[peerId]) {
+      if (!stats || !roomState[roomId].peers[peerId]) {
         continue;
       }
-      roomState.peers[peerId].stats.consumers[consumer.id] = {
+      roomState[peerId].peers[peerId].stats.consumers[consumer.id] = {
         bitrate: stats.bitrate,
         fractionLost: stats.fractionLost,
         score: stats.score
       }
     } catch (e) {
-      warn('error while updating consumer stats', e);
+      console.warn('error while updating consumer stats', e);
     }
   }
 }
