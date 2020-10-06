@@ -135,10 +135,6 @@ function setSocketHandlers(socket) {
     socket.on('disconnect', () => {
         logSocket(`socketio disconnect`);
     });
-    socket.on('chat-message', (data) => {
-        logSocket('chat-message');
-        io.emit('chat-message', data);
-    });
     // --> /signaling/router-capabilities
     //
     //
@@ -187,6 +183,9 @@ function setSocketHandlersForPeer(socket, peerId, roomId) {
         log('disconnect', peerId);
         await closePeer(roomId, peerId);
         updatePeers(roomId);
+    });
+    socket.on('chat-message', (data) => {
+        io.to(`room:${roomId}`).emit('chat-message', data);
     });
     // --> /signaling/create-transport
     //
@@ -270,7 +269,8 @@ function setSocketHandlersForPeer(socket, peerId, roomId) {
     //
     // called from inside a client's `transport.on('produce')` event handler.
     //
-    socket.on('/send-track', withAsyncSocketHandler(async (data) => {
+    socket.on('send-track', withAsyncSocketHandler(async (data) => {
+        console.log("send-track");
         const { transportId, kind, rtpParameters, paused, appData } = protocol.sendTrackRequest(data);
         if (!(roomId in roomState)) {
             throw new Error(`No room ${roomId}`);
