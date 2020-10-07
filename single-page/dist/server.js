@@ -36,9 +36,8 @@ expressApp.disable("x-powered-by");
 // The Sentry handler must be the first middleware in the stack
 expressApp.use(Sentry.Handlers.requestHandler());
 const log = debugModule('demo-app');
-// one mediasoup worker and router
-//
-let worker, router;
+// One worker. If we scale this to multiple CPUs, we should create more workers
+let worker;
 const emptyRoom = Object.freeze({
     // external
     peers: {},
@@ -49,8 +48,6 @@ const emptyRoom = Object.freeze({
 });
 const roomState = {};
 //
-// we also send information about the active speaker, as tracked by
-// our audioLevelObserver.
 //
 // internally, we keep lists of transports, producers, and
 // consumers. whenever we create a transport, producer, or consumer,
@@ -58,12 +55,6 @@ const roomState = {};
 // and consumers we also keep track of the client-side "media tag", to
 // correlate tracks.
 //
-//
-// our http server needs to send 'index.html' and 'client-bundle.js'.
-// might as well just send everything in this directory ...
-//
-const dir = __dirname.replace(/dist$/, "");
-expressApp.use(express_1.default.static(dir));
 function createHttpsServer() {
     const https = require('https');
     const tls = {
@@ -96,7 +87,7 @@ function withAsyncHandler(handler) {
 async function main() {
     // start mediasoup
     console.log('starting mediasoup');
-    ({ worker, router } = await startMediasoup());
+    worker = await startMediasoup();
     // start https server, falling back to http if https fails
     console.log('starting express');
     let server;
@@ -135,12 +126,6 @@ function setSocketHandlers(socket) {
     socket.on('disconnect', () => {
         logSocket(`socketio disconnect`);
     });
-    // --> /signaling/router-capabilities
-    //
-    //
-    socket.on('router-capabilities', withAsyncSocketHandler(async function () {
-        return { routerRtpCapabilities: router.rtpCapabilities };
-    }));
     // --> /signaling/join-as-new-peer
     //
     // adds the peer to the roomState data structure and creates a
@@ -152,14 +137,18 @@ function setSocketHandlers(socket) {
         const { peerId, roomId } = request;
         console.log('join-as-new-peer', peerId, roomId);
         if (!(roomId in roomState)) {
-            roomState[roomId] = Object.assign({}, emptyRoom);
+            // Create a new room with a new router
+            const mediaCodecs = config.mediasoup.router.mediaCodecs;
+            const router = await worker.createRouter({ mediaCodecs });
+            roomState[roomId] = Object.assign({ router }, emptyRoom);
         }
-        roomState[roomId].peers[peerId] = {
+        const room = roomState[roomId];
+        room.peers[peerId] = {
             joinTs: Date.now(),
             media: {}, consumerLayers: {}, stats: { producers: {}, consumers: {} }
         };
         const response = {
-            routerRtpCapabilities: router.rtpCapabilities
+            routerRtpCapabilities: room.router.rtpCapabilities
         };
         updatePeers(roomId);
         setSocketHandlersForPeer(socket, peerId, roomId);
@@ -195,13 +184,12 @@ function setSocketHandlersForPeer(socket, peerId, roomId) {
     socket.on('create-transport', withAsyncSocketHandler(async (data) => {
         const request = protocol.createTransportRequest(data);
         log('create-transport', peerId, request.direction);
-        let transport = await createWebRtcTransport({ peerId, direction: request.direction });
-        if (roomId in roomState) {
-            roomState[roomId].transports[transport.id] = transport;
+        if (!(roomId in roomState)) {
+            throw new Error(`No room ${roomId}`);
         }
-        else {
-            console.warn(`create-transport unable to find room ${roomId}`);
-        }
+        const room = roomState[roomId];
+        let transport = await createWebRtcTransport({ router: room.router, peerId, direction: request.direction });
+        room.transports[transport.id] = transport;
         let { id, iceParameters, iceCandidates, dtlsParameters } = transport;
         const response = {
             transportOptions: { id, iceParameters, iceCandidates, dtlsParameters }
@@ -312,17 +300,18 @@ function setSocketHandlersForPeer(socket, peerId, roomId) {
         if (!(roomId in roomState)) {
             throw new Error(`No room ${roomId}`);
         }
-        const producer = roomState[roomId].producers.find((p) => p.appData.mediaTag === mediaTag &&
+        const room = roomState[roomId];
+        const producer = room.producers.find((p) => p.appData.mediaTag === mediaTag &&
             p.appData.peerId === mediaPeerId);
         if (!producer) {
             throw new Error('server-side producer for ' + `${mediaPeerId}:${mediaTag} not found`);
         }
-        if (!router.canConsume({ producerId: producer.id,
+        if (!room.router.canConsume({ producerId: producer.id,
             // @ts-ignore
             rtpCapabilities })) {
             throw new Error(`client cannot consume ${mediaPeerId}:${mediaTag}`);
         }
-        const transport = Object.values(roomState[roomId].transports).find((t) => t.appData.peerId === peerId && t.appData.clientDirection === 'recv');
+        const transport = Object.values(room.transports).find((t) => t.appData.peerId === peerId && t.appData.clientDirection === 'recv');
         if (!transport) {
             throw new Error(`server-side recv transport for ${peerId} not found`);
         }
@@ -347,8 +336,8 @@ function setSocketHandlersForPeer(socket, peerId, roomId) {
         // stick this consumer in our list of consumers to keep track of,
         // and create a data structure to track the client-relevant state
         // of this consumer
-        roomState[roomId].consumers.push(consumer);
-        roomState[roomId].peers[peerId].consumerLayers[consumer.id] = {
+        room.consumers.push(consumer);
+        room.peers[peerId].consumerLayers[consumer.id] = {
             currentLayer: null,
             clientSelectedLayer: null
         };
@@ -515,9 +504,7 @@ async function startMediasoup() {
         console.error('mediasoup worker died (this should never happen)');
         process.exit(1);
     });
-    const mediaCodecs = config.mediasoup.router.mediaCodecs;
-    const router = await worker.createRouter({ mediaCodecs });
-    return { worker, router };
+    return worker;
 }
 //
 // -- our minimal signaling is just http polling --
@@ -591,7 +578,7 @@ async function closeConsumer(roomId, consumer) {
     }
 }
 async function createWebRtcTransport(params) {
-    const { peerId, direction } = params;
+    const { peerId, direction, router } = params;
     const { listenIps, initialAvailableOutgoingBitrate } = config.mediasoup.webRtcTransport;
     const transport = await router.createWebRtcTransport({
         listenIps: listenIps,
