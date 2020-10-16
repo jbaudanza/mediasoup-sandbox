@@ -162,8 +162,17 @@ async function main() {
                     `https://${config.httpIp}:${config.httpPort}`);
   });
 
-  // Socket.io
-  io = require('socket.io')(server, { serveClient: false });
+  //
+  // The default for pingTimeout is 5000. This seems very aggressive, especially because
+  // timers are throttled when the app runs in background mode.
+  // There are some comments about socketio in this thread:
+  //  https://mediasoup.discourse.group/t/transport-connectionstate-changes-do-disconnected/1443/8
+  //
+  io = require('socket.io')(server, {
+    serveClient: false,
+    pingInterval: 30000,
+    pingTimeout: 30000
+  });
 
   io.on('connection', socket => {
     setSocketHandlers(socket);
@@ -174,13 +183,18 @@ import type { GuardType } from "decoders";
 
 function setSocketHandlers(socket: SocketIO.Socket) {
   function logSocket(msg: string) {
-    console.log(`[${new Date().toISOString()}] ${socket.id} ${msg}`)
+    console.log(`[${new Date().toISOString()}] ${socket.handshake.address} ${socket.id} ${msg}`)
   }
 
   logSocket("socketio connection");
 
-  socket.on('disconnect', () => {
-    logSocket(`socketio disconnect`);
+  socket.on('disconnect', (reason) => {
+    logSocket(`socketio disconnect: ${reason}`);
+  });
+
+  socket.on('disconnect', (error) => {
+    logSocket(`socketio error:`);
+    console.error(error);
   });
 
   // --> /signaling/join-as-new-peer
