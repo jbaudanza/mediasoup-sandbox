@@ -288,6 +288,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string, roomI
 
   socket.on('chat-message', (data: object) => {
     io.to(`room:${roomId}`).emit('chat-message', {
+      timestamp: Date.now(),
       userId: userIdFromSocket(socket),
       body: data
     });
