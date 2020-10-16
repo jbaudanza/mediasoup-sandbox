@@ -203,7 +203,7 @@ function setSocketHandlers(socket: SocketIO.Socket) {
     logSocket(`socketio disconnect: ${reason}`);
   });
 
-  socket.on('disconnect', (error) => {
+  socket.on('error', (error) => {
     logSocket(`socketio error:`);
     console.error(error);
   });
@@ -274,10 +274,14 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string, roomI
     return ({ left: true });
   }));
 
-  socket.on('disconnect', async () => {
-    log('disconnect', peerId);
-    await closePeer(roomId, peerId);
-    updatePeers(roomId);
+  socket.on('disconnect', () => {
+    closePeer(roomId, peerId).then(() => {
+      updatePeers(roomId);
+    }, (error) => {
+      console.error(error);
+      Sentry.captureException(error);
+    })
+
   });
 
   socket.on('chat-message', (data: object) => {
@@ -733,7 +737,7 @@ async function startMediasoup() {
 //
 expressApp.use(express.json({ type: '*/*' }));
 
-function closePeer(roomId: string, peerId: string) {
+async function closePeer(roomId: string, peerId: string) {
   log('closing peer', peerId);
   const room = roomState[roomId];
   if (room == null) {
@@ -742,13 +746,30 @@ function closePeer(roomId: string, peerId: string) {
     for (let [id, transport] of Object.entries(room.transports)) {
       if (transport.appData.peerId === peerId) {
         try {
-          closeTransport(roomId, transport);
+          await closeTransport(roomId, transport);
         } catch(e) {
           console.error(e);
         }
       }
     }
     delete room.peers[peerId];
+
+    if (Object.keys(room.peers).length === 0) {
+
+      console.log(`Closing room #{roomId}`);
+
+      // Close any remaining transports (there shouldn't be any though if the room is empty)
+      for (let [id, transport] of Object.entries(room.transports)) {
+        try {
+          console.log(`Closing zombie transport ${id}`)
+          await closeTransport(roomId, transport);
+        } catch(e) {
+          console.error(e);
+        }
+      }
+
+      delete roomState[roomId];
+    }
   }
 }
 

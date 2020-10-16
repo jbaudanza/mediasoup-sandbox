@@ -144,7 +144,7 @@ function setSocketHandlers(socket) {
     socket.on('disconnect', (reason) => {
         logSocket(`socketio disconnect: ${reason}`);
     });
-    socket.on('disconnect', (error) => {
+    socket.on('error', (error) => {
         logSocket(`socketio error:`);
         console.error(error);
     });
@@ -202,10 +202,13 @@ function setSocketHandlersForPeer(socket, peerId, roomId) {
         updatePeers(roomId);
         return ({ left: true });
     }));
-    socket.on('disconnect', async () => {
-        log('disconnect', peerId);
-        await closePeer(roomId, peerId);
-        updatePeers(roomId);
+    socket.on('disconnect', () => {
+        closePeer(roomId, peerId).then(() => {
+            updatePeers(roomId);
+        }, (error) => {
+            console.error(error);
+            Sentry.captureException(error);
+        });
     });
     socket.on('chat-message', (data) => {
         io.to(`room:${roomId}`).emit('chat-message', {
@@ -551,7 +554,7 @@ async function startMediasoup() {
 // signaling endpoints. (sendBeacon can't set the Content-Type header)
 //
 expressApp.use(express_1.default.json({ type: '*/*' }));
-function closePeer(roomId, peerId) {
+async function closePeer(roomId, peerId) {
     log('closing peer', peerId);
     const room = roomState[roomId];
     if (room == null) {
@@ -561,7 +564,7 @@ function closePeer(roomId, peerId) {
         for (let [id, transport] of Object.entries(room.transports)) {
             if (transport.appData.peerId === peerId) {
                 try {
-                    closeTransport(roomId, transport);
+                    await closeTransport(roomId, transport);
                 }
                 catch (e) {
                     console.error(e);
@@ -569,6 +572,20 @@ function closePeer(roomId, peerId) {
             }
         }
         delete room.peers[peerId];
+        if (Object.keys(room.peers).length === 0) {
+            console.log(`Closing room #{roomId}`);
+            // Close any remaining transports (there shouldn't be any though if the room is empty)
+            for (let [id, transport] of Object.entries(room.transports)) {
+                try {
+                    console.log(`Closing zombie transport ${id}`);
+                    await closeTransport(roomId, transport);
+                }
+                catch (e) {
+                    console.error(e);
+                }
+            }
+            delete roomState[roomId];
+        }
     }
 }
 async function closeTransport(roomId, transport) {
