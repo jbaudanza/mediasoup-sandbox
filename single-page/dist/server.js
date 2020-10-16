@@ -26,6 +26,7 @@ const config = require('../config');
 const debugModule = require('debug');
 const mediasoup = __importStar(require("mediasoup"));
 const express_1 = __importDefault(require("express"));
+const socketio_jwt_1 = __importDefault(require("socketio-jwt"));
 const Sentry = __importStar(require("@sentry/node"));
 const protocol = __importStar(require("./protocol"));
 Sentry.init({ dsn: process.env["SENTRY_DSN"] });
@@ -81,6 +82,13 @@ function withAsyncHandler(handler) {
         });
     };
 }
+let applicationSecret;
+if (typeof process.env["JWT_SECRET"] !== "string") {
+    throw new Error("Missing JWT_SECRET env variable");
+}
+else {
+    applicationSecret = process.env["JWT_SECRET"];
+}
 //
 // main() -- our execution entry point
 //
@@ -123,9 +131,10 @@ async function main() {
         pingInterval: 30000,
         pingTimeout: 30000
     });
-    io.on('connection', socket => {
-        setSocketHandlers(socket);
-    });
+    io.on('connection', socketio_jwt_1.default.authorize({
+        secret: applicationSecret,
+        timeout: 15000 // 15 seconds to send the authentication message
+    })).on("authenticated", setSocketHandlers);
 }
 function setSocketHandlers(socket) {
     function logSocket(msg) {
@@ -158,6 +167,7 @@ function setSocketHandlers(socket) {
         const room = roomState[roomId];
         room.peers[peerId] = {
             joinTs: Date.now(),
+            userId: userIdFromSocket(socket),
             media: {}, consumerLayers: {}, stats: { producers: {}, consumers: {} }
         };
         const response = {
@@ -168,6 +178,17 @@ function setSocketHandlers(socket) {
         socket.join(`room:${roomId}`);
         return response;
     }));
+}
+function userIdFromSocket(socket) {
+    //@ts-ignore missing definitions for decoded_token
+    const decoded_token = socket.decoded_token;
+    const userId = Number(decoded_token.sub);
+    if (Number.isFinite(userId)) {
+        return userId;
+    }
+    else {
+        throw new Error("Expected userId to be a number");
+    }
 }
 function setSocketHandlersForPeer(socket, peerId, roomId) {
     // --> /signaling/leave
@@ -187,7 +208,10 @@ function setSocketHandlersForPeer(socket, peerId, roomId) {
         updatePeers(roomId);
     });
     socket.on('chat-message', (data) => {
-        io.to(`room:${roomId}`).emit('chat-message', data);
+        io.to(`room:${roomId}`).emit('chat-message', {
+            userId: userIdFromSocket(socket),
+            body: data
+        });
     });
     // --> /signaling/create-transport
     //

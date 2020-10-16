@@ -3,6 +3,8 @@ const debugModule = require('debug');
 import * as mediasoup from "mediasoup";
 import express from "express";
 import socketio from "socket.io";
+import socketioJwt from "socketio-jwt";
+
 import * as Sentry from "@sentry/node";
 
 import * as protocol from "./protocol";
@@ -84,6 +86,7 @@ type Peer = {
     producers: {[key: string]: Array<ProducerStats>}
     consumers: {[key: string]: ConsumerStats}
   },
+  userId: number,
   consumerLayers: {[key: string]: { currentLayer: string | null, clientSelectedLayer: boolean | null } }
 };
 
@@ -126,6 +129,13 @@ function withAsyncHandler(handler: express.Handler): express.Handler {
       next(error);
     });
   };
+}
+
+let applicationSecret: string;
+if (typeof process.env["JWT_SECRET"] !== "string") {
+  throw new Error("Missing JWT_SECRET env variable");
+} else {
+  applicationSecret = process.env["JWT_SECRET"];
 }
 
 //
@@ -174,9 +184,10 @@ async function main() {
     pingTimeout: 30000
   });
 
-  io.on('connection', socket => {
-    setSocketHandlers(socket);
-  });
+  io.on('connection', socketioJwt.authorize({
+    secret: applicationSecret,
+    timeout: 15000 // 15 seconds to send the authentication message
+  })).on("authenticated", setSocketHandlers);
 }
 
 import type { GuardType } from "decoders";
@@ -219,6 +230,7 @@ function setSocketHandlers(socket: SocketIO.Socket) {
 
     room.peers[peerId] = {
       joinTs: Date.now(),
+      userId: userIdFromSocket(socket),
       media: {}, consumerLayers: {}, stats: { producers: {}, consumers: {}}
     };
 
@@ -234,6 +246,17 @@ function setSocketHandlers(socket: SocketIO.Socket) {
 
     return response;
   }));
+}
+
+function userIdFromSocket(socket: SocketIO.Socket): number {
+  //@ts-ignore missing definitions for decoded_token
+  const decoded_token = socket.decoded_token;
+  const userId = Number(decoded_token.sub);
+  if (Number.isFinite(userId)) {
+    return userId;
+  } else {
+    throw new Error("Expected userId to be a number");
+  }
 }
 
 function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string, roomId: string) {
@@ -258,7 +281,10 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string, roomI
   });
 
   socket.on('chat-message', (data: object) => {
-    io.to(`room:${roomId}`).emit('chat-message', data);    
+    io.to(`room:${roomId}`).emit('chat-message', {
+      userId: userIdFromSocket(socket),
+      body: data
+    });
   });
 
   // --> /signaling/create-transport
