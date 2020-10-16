@@ -758,7 +758,7 @@ async function closePeer(roomId: string, peerId: string) {
 
     if (Object.keys(room.peers).length === 0) {
 
-      console.log(`Closing room #{roomId}`);
+      console.log(`Closing room ${roomId}`);
 
       // Close any remaining transports (there shouldn't be any though if the room is empty)
       for (let [id, transport] of Object.entries(room.transports)) {
