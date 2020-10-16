@@ -71,9 +71,11 @@ function createHttpServer() {
 }
 let io;
 function updatePeers(roomId) {
-    io.to(`room:${roomId}`).emit("peers", {
-        peers: roomState[roomId].peers
-    });
+    if (roomId in roomState) {
+        io.to(`room:${roomId}`).emit("peers", {
+            peers: roomState[roomId].peers
+        });
+    }
 }
 function withAsyncHandler(handler) {
     return (req, res, next) => {
