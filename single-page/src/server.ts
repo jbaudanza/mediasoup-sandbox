@@ -76,7 +76,7 @@ const roomState: { [roomId: string]: Room } = {};
   
 //
 // for each peer that connects, we keep a table of peers and what
-// tracks are being sent and received.
+// tracks are being sent and received. 
 //
 type Peer = {
   joinTs: number,
@@ -115,7 +115,7 @@ function createHttpServer() {
   return server;
 }
 
-let io: Socket;
+let io: SocketIO.Server;
 
 function updatePeers(roomId: string) {
   if (roomId in roomState) {
@@ -180,21 +180,29 @@ async function main() {
   // There are some comments about socketio in this thread:
   //  https://mediasoup.discourse.group/t/transport-connectionstate-changes-do-disconnected/1443/8
   //
-  io = require('socket.io')(server, {
+  io = require('socket.io')(server, { 
     serveClient: false,
     pingInterval: 30000,
     pingTimeout: 30000
   });
 
-  io.on('connection', socketioJwt.authorize({
-    secret: applicationSecret,
-    timeout: 15000 // 15 seconds to send the authentication message
-  })).on("authenticated", setSocketHandlers);
+  io.use(
+    socketioJwt.authorize({
+      secret: applicationSecret,
+      handshake: true // Allows JWT in the "Authentication" header
+    })
+  );
+
+  io.on("connect", (socket) => {
+    setSocketHandlers(socket).catch(error => {
+      Sentry.captureException(error);
+    });
+  });
 }
 
 import type { GuardType } from "decoders";
 
-function setSocketHandlers(socket: SocketIO.Socket) {
+async function setSocketHandlers(socket: SocketIO.Socket) {
   function logSocket(msg: string) {
     console.log(`[${new Date().toISOString()}] ${socket.handshake.address} ${socket.id} ${msg}`)
   }
@@ -210,44 +218,44 @@ function setSocketHandlers(socket: SocketIO.Socket) {
     console.error(error);
   });
 
-  // --> /signaling/join-as-new-peer
-  //
+  const { roomId } = socket.handshake.query;
+  if (!roomId) {
+    console.warn("Missing room ID");
+    socket.disconnect();
+    return;
+  }
+
   // adds the peer to the roomState data structure and creates a
   // transport that the peer will use for receiving media. returns
   // router rtpCapabilities for mediasoup-client device initialization
   //
-  socket.on('join-as-new-peer', withAsyncSocketHandler(async function(data) {
-    const request = protocol.joinAsNewPeerRequest(data);
-    const {peerId, roomId} = request;
-    console.log('join-as-new-peer', peerId, roomId);
+  console.log('join-as-new-peer', roomId);
 
-    if (!(roomId in roomState)) {
-      // Create a new room with a new router
-      const mediaCodecs = config.mediasoup.router.mediaCodecs;
-      const router = await worker.createRouter({ mediaCodecs });
+  if (!(roomId in roomState)) {
+    // Create a new room with a new router
+    const mediaCodecs = config.mediasoup.router.mediaCodecs;
+    const router = await worker.createRouter({ mediaCodecs });
 
-      roomState[roomId] = Object.assign({ router }, emptyRoom);
-    }
-    const room = roomState[roomId];
+    roomState[roomId] = Object.assign({ router }, emptyRoom);
+  }
+  const room = roomState[roomId];
 
-    room.peers[peerId] = {
-      joinTs: Date.now(),
-      userId: userIdFromSocket(socket),
-      media: {}, consumerLayers: {}, stats: { producers: {}, consumers: {}}
-    };
+  room.peers[socket.id] = {
+    joinTs: Date.now(),
+    userId: userIdFromSocket(socket),
+    media: {}, consumerLayers: {}, stats: { producers: {}, consumers: {}}
+  };
 
-    const response: GuardType<typeof protocol.joinAsNewPeerResponse> = { 
-      routerRtpCapabilities: room.router.rtpCapabilities
-    };
+  const response: GuardType<typeof protocol.joinAsNewPeerResponse> = { 
+    routerRtpCapabilities: room.router.rtpCapabilities
+  };
+  socket.emit("router-rtp-capabilities", response);
 
-    updatePeers(roomId);
+  updatePeers(roomId);
 
-    setSocketHandlersForPeer(socket, peerId, roomId);
+  setSocketHandlersForPeer(socket, roomId);
 
-    socket.join(`room:${roomId}`);
-
-    return response;
-  }));
+  socket.join(`room:${roomId}`);
 }
 
 function userIdFromSocket(socket: SocketIO.Socket): number {
@@ -261,29 +269,29 @@ function userIdFromSocket(socket: SocketIO.Socket): number {
   }
 }
 
-function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string, roomId: string) {
+function setSocketHandlersForPeer(socket: SocketIO.Socket, roomId: string) {
   // --> /signaling/leave
   //
   // removes the peer from the roomState data structure and and closes
   // all associated mediasoup objects
   //
   socket.on('leave', withAsyncSocketHandler(async function(data) {
-    log('leave', peerId);
+    log('leave', socket.id);
 
-    await closePeer(roomId, peerId);
+    await closePeer(roomId, socket.id);
     updatePeers(roomId);
 
     return ({ left: true });
   }));
 
   socket.on('disconnect', () => {
-    closePeer(roomId, peerId).then(() => {
+    closePeer(roomId, socket.id).then(() => {
       updatePeers(roomId);
     }, (error) => {
       console.error(error);
       Sentry.captureException(error);
     })
-
+    
   });
 
   socket.on('chat-message', (data: object) => {
@@ -291,7 +299,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string, roomI
       timestamp: Date.now(),
       userId: userIdFromSocket(socket),
       body: data
-    });
+    });    
   });
 
   // --> /signaling/create-transport
@@ -301,14 +309,14 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string, roomI
   //
   socket.on('create-transport', withAsyncSocketHandler(async (data) => {
     const request = protocol.createTransportRequest(data);
-    log('create-transport', peerId, request.direction);
+    log('create-transport', socket.id, request.direction);
 
     if (!(roomId in roomState)) {
       throw new Error(`No room ${roomId}`);
     }
     const room = roomState[roomId];
 
-    let transport = await createWebRtcTransport({ router: room.router, peerId, direction: request.direction });
+    let transport = await createWebRtcTransport({ router: room.router, peerId: socket.id, direction: request.direction });
     room.transports[transport.id] = transport;
 
     let { id, iceParameters, iceCandidates, dtlsParameters } = transport;
@@ -338,7 +346,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string, roomI
       throw new Error(`connect-transport: server-side transport ${transportId} not found`);
     }
 
-    log('connect-transport', peerId, transport.appData);
+    log('connect-transport', socket.id, transport.appData);
 
     await transport.connect({ dtlsParameters });
 
@@ -365,7 +373,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string, roomI
       throw new Error(`close-transport: server-side transport ${transportId} not found`);
     }
 
-    log('close-transport', peerId, transport.appData);
+    log('close-transport', socket.id, transport.appData);
 
     await closeTransport(roomId, transport);
 
@@ -391,7 +399,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string, roomI
       throw new Error(`close-producer: server-side producer ${producerId} not found`);
     }
 
-    log('close-producer', peerId, producer.appData);
+    log('close-producer', socket.id, producer.appData);
 
     await closeProducer(roomId, producer);
 
@@ -423,7 +431,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string, roomI
       // @ts-ignore
       rtpParameters,
       paused,
-      appData: { ...appData, peerId, transportId }
+      appData: { ...appData, peerId: socket.id, transportId }
     });
 
     // if our associated transport closes, close ourself, too
@@ -433,7 +441,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string, roomI
     });
 
     roomState[roomId].producers.push(producer);
-    roomState[roomId].peers[peerId].media[appData.mediaTag] = {
+    roomState[roomId].peers[socket.id].media[appData.mediaTag] = {
       paused,
       // @ts-ignore
       encodings: rtpParameters.encodings
@@ -468,18 +476,18 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string, roomI
       throw new Error('server-side producer for ' + `${mediaPeerId}:${mediaTag} not found`);
     }
 
-    if (!room.router.canConsume({ producerId: producer.id,
+    if (!room.router.canConsume({ producerId: producer.id, 
       // @ts-ignore
       rtpCapabilities })) {
       throw new Error(`client cannot consume ${mediaPeerId}:${mediaTag}`);
     }
 
     const transport = Object.values(room.transports).find((t) =>
-      t.appData.peerId === peerId && t.appData.clientDirection === 'recv'
+      t.appData.peerId === socket.id && t.appData.clientDirection === 'recv'
     );
 
     if (!transport) {
-      throw new Error(`server-side recv transport for ${peerId} not found`);
+      throw new Error(`server-side recv transport for ${socket.id} not found`);
     }
 
     const consumer = await transport.consume({
@@ -487,7 +495,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string, roomI
       // @ts-ignore
       rtpCapabilities,
       paused: true, // see note above about always starting paused
-      appData: { peerId, mediaPeerId, mediaTag }
+      appData: { peerId: socket.id, mediaPeerId, mediaTag }
     });
 
     // need both 'transportclose' and 'producerclose' event handlers,
@@ -506,17 +514,17 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string, roomI
     // and create a data structure to track the client-relevant state
     // of this consumer
     room.consumers.push(consumer);
-    room.peers[peerId].consumerLayers[consumer.id] = {
+    room.peers[socket.id].consumerLayers[consumer.id] = {
       currentLayer: null,
       clientSelectedLayer: null
     };
 
     // update above data structure when layer changes.
     consumer.on('layerschange', (layers) => {
-      log(`consumer layerschange ${mediaPeerId}->${peerId}`, mediaTag, layers);
-      if (roomState[roomId].peers[peerId] &&
-          roomState[roomId].peers[peerId].consumerLayers[consumer.id]) {
-        roomState[roomId].peers[peerId].consumerLayers[consumer.id]
+      log(`consumer layerschange ${mediaPeerId}->${socket.id}`, mediaTag, layers);
+      if (roomState[roomId].peers[socket.id] &&
+          roomState[roomId].peers[socket.id].consumerLayers[consumer.id]) {
+        roomState[roomId].peers[socket.id].consumerLayers[consumer.id]
           .currentLayer = layers && layers.spatialLayer;
       }
     });
@@ -652,7 +660,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string, roomI
     await producer.pause();
 
     if (roomState[roomId]) {
-      roomState[roomId].peers[peerId].media[producer.appData.mediaTag].paused = true;
+      roomState[roomId].peers[socket.id].media[producer.appData.mediaTag].paused = true;
     } else {
       console.warn(`pause-producer unable to find roomId ${roomId}`);
     }
@@ -682,7 +690,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, peerId: string, roomI
     await producer.resume();
 
     if (roomState[roomId]) {
-      roomState[roomId].peers[peerId].media[producer.appData.mediaTag].paused = false;
+      roomState[roomId].peers[socket.id].media[producer.appData.mediaTag].paused = false;
     } else {
       console.warn(`resume-producer unable to find roomId ${roomId}`);
     }
@@ -760,7 +768,7 @@ async function closePeer(roomId: string, peerId: string) {
     if (Object.keys(room.peers).length === 0) {
 
       console.log(`Closing room ${roomId}`);
-
+      
       // Close any remaining transports (there shouldn't be any though if the room is empty)
       for (let [id, transport] of Object.entries(room.transports)) {
         try {

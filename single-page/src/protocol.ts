@@ -2,10 +2,6 @@ import {
   guard, number, object, string, boolean, mixed, either, constant, json, jsonObject
 } from 'decoders';
 
-export const joinAsNewPeerRequest = guard(object({
-  peerId: string,
-  roomId: string
-}));
 export const joinAsNewPeerResponse = guard(object({
   routerRtpCapabilities: mixed
 }));

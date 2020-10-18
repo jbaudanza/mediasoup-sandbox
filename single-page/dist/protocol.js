@@ -1,11 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.closeProducerRequest = exports.resumeProducerRequest = exports.pauseProducerRequest = exports.closeConsumerRequest = exports.resumeConsumerRequest = exports.pauseConsumerRequest = exports.recvTrackResponse = exports.recvTrackRequest = exports.sendTrackResponse = exports.sendTrackRequest = exports.closeTransportRequest = exports.connectTransportRequest = exports.createTransportResponse = exports.createTransportRequest = exports.joinAsNewPeerResponse = exports.joinAsNewPeerRequest = void 0;
+exports.closeProducerRequest = exports.resumeProducerRequest = exports.pauseProducerRequest = exports.closeConsumerRequest = exports.resumeConsumerRequest = exports.pauseConsumerRequest = exports.recvTrackResponse = exports.recvTrackRequest = exports.sendTrackResponse = exports.sendTrackRequest = exports.closeTransportRequest = exports.connectTransportRequest = exports.createTransportResponse = exports.createTransportRequest = exports.joinAsNewPeerResponse = void 0;
 const decoders_1 = require("decoders");
-exports.joinAsNewPeerRequest = decoders_1.guard(decoders_1.object({
-    peerId: decoders_1.string,
-    roomId: decoders_1.string
-}));
 exports.joinAsNewPeerResponse = decoders_1.guard(decoders_1.object({
     routerRtpCapabilities: decoders_1.mixed
 }));
