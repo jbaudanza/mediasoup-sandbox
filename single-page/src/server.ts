@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const config = require('../config');
 const debugModule = require('debug');
 import * as mediasoup from "mediasoup";
@@ -23,7 +25,7 @@ expressApp.use(Sentry.Handlers.requestHandler());
 
 const log = debugModule('demo-app');
 
-// TODO: Is this the most graceful way?
+import type { PlainTransport } from "mediasoup/lib/PlainTransport";
 import type { Consumer } from "mediasoup/lib/Consumer";
 import type { Producer } from "mediasoup/lib/Producer";
 import type { Transport } from "mediasoup/lib/Transport";
@@ -32,6 +34,7 @@ import type { Worker } from "mediasoup/lib/Worker";
 
 import type { Socket } from "socket.io";
 
+let mediaProcessorSocketId: string | null = null
 
 // One worker. If we scale this to multiple CPUs, we should create more workers
 let worker: Worker;
@@ -80,7 +83,7 @@ const roomState: { [roomId: string]: Room } = {};
 //
 type Peer = {
   joinTs: number,
-  // TODO: I think this can be completed derived from the producers lists
+  // TODO: I think this can be completely derived from the producers lists
   media: { [key: string]: Media },
   stats: { 
     producers: {[key: string]: Array<ProducerStats>}
@@ -218,6 +221,129 @@ async function setSocketHandlers(socket: SocketIO.Socket) {
     console.error(error);
   });
 
+  // @ts-ignore no types for decoded_token
+  if (socket.decoded_token.service === "media-processing") {
+    setSocketHandlersForMediaProcessor(socket);
+  } else {
+    setSocketHandlersForUser(socket);
+  }
+}
+
+async function setSocketHandlersForMediaProcessor(socket: SocketIO.Socket) {
+  console.log("Connection from media processor") ;
+
+  const transports: { [id: string]: Transport } = {};
+  const consumers: { [id: string]: Consumer } = {};
+
+  if (mediaProcessorSocketId != null) {
+    console.warn(`"Media Processor already connected on socket ${mediaProcessorSocketId}`)
+  }
+
+  socket.on('disconnect', () => {
+    console.log("Disconnection from media processor");
+    mediaProcessorSocketId = null;
+    
+    // TODO: Close all transports and consumers
+
+    // Remove all event handlers to prevent memory leaks
+    socket.removeAllListeners();
+  });
+
+  socket.on('create-plain-transport', withAsyncSocketHandler(async (data) => {
+    const request = protocol.createPlainTransportRequest(data);
+
+    const room = roomState[request.roomId];
+    if (room == null) {
+      throw Error(`No such room ${request.roomId}`)
+    }
+
+    // TODO: This should be a config file somewhere
+    const listenIp: { ip: string, announcedIp?: string } = { ip: "127.0.0.1" };
+
+    const transport = await room.router.createPlainTransport({
+      // No RTP will be received from the remote side
+      comedia: false,
+
+      // FFmpeg and GStreamer don't support RTP/RTCP multiplexing ("a=rtcp-mux" in SDP)
+      rtcpMux: false,
+
+      listenIp
+    });
+
+    transports[transport.id] = transport;
+
+    await transport.connect({
+      ip: request.ipAddress,
+      port: request.rtpPort,
+      rtcpPort: request.rtcpPort,
+    });
+
+    console.log(
+      "mediasoup AUDIO RTP SEND transport connected: %s:%d <--> %s:%d (%s)",
+      transport.tuple.localIp,
+      transport.tuple.localPort,
+      transport.tuple.remoteIp,
+      transport.tuple.remotePort,
+      transport.tuple.protocol
+    );
+
+    const ipAddress = (listenIp.ip || listenIp.announcedIp);
+    return { transportId: transport.id, ipAddress  };
+  }));
+
+
+  // TODO: Do it make sense to merge this with create-plain-transport?
+  // Would you ever reusing an RTP transport? I don't think so
+  socket.on('recv-track', withAsyncSocketHandler(async (data) => {
+    const request = protocol.recvRtpTrackRequest(data);
+
+    const room = roomState[request.roomId];
+    if (room == null) {
+      throw Error(`No such room ${request.roomId}`)
+    }
+
+    const transport = transports[request.transportId];
+    if (transport == null) {
+      throw Error(`No such transport ${request.transportId}`) 
+    }
+
+    const consumer = await transport.consume({
+      producerId: request.producerId,
+      rtpCapabilities: room.router.rtpCapabilities, // Assume the recorder supports same formats as mediasoup's router
+      paused: true
+    });
+
+    consumers[consumer.id] = consumer;
+
+    console.log(
+      "mediasoup AUDIO RTP SEND consumer created, kind: %s, type: %s",
+      consumer.kind,
+      consumer.type
+    );
+
+    return {
+      consumerId: consumer.id,
+      rtpParameters: consumer.rtpParameters
+    }
+  }));
+
+  socket.on('resume-consumer', withAsyncHandler(async (data) => {
+    const { consumerId } = protocol.resumeConsumerRequest(data);
+
+    const consumer = consumers[consumerId];
+    if (consumer == null) {
+      throw new Error(`server-side consumer ${consumerId} not found`);
+    }
+
+    await consumer.resume();
+
+    return { resumed: true };
+  }));
+
+  mediaProcessorSocketId = socket.id;
+}
+
+async function setSocketHandlersForUser(socket: SocketIO.Socket) {
   const { roomId } = socket.handshake.query;
   if (!roomId) {
     console.warn("Missing room ID");
@@ -225,12 +351,12 @@ async function setSocketHandlers(socket: SocketIO.Socket) {
     return;
   }
 
+  const userId = userIdFromSocket(socket);
+
   // adds the peer to the roomState data structure and creates a
   // transport that the peer will use for receiving media. returns
   // router rtpCapabilities for mediasoup-client device initialization
   //
-  console.log('join-as-new-peer', roomId);
-
   if (!(roomId in roomState)) {
     // Create a new room with a new router
     const mediaCodecs = config.mediasoup.router.mediaCodecs;
@@ -242,18 +368,19 @@ async function setSocketHandlers(socket: SocketIO.Socket) {
 
   room.peers[socket.id] = {
     joinTs: Date.now(),
-    userId: userIdFromSocket(socket),
+    userId: userId,
     media: {}, consumerLayers: {}, stats: { producers: {}, consumers: {}}
   };
 
   const response: GuardType<typeof protocol.joinAsNewPeerResponse> = { 
     routerRtpCapabilities: room.router.rtpCapabilities
   };
+  console.log("sending router-rtp-capabilities");
   socket.emit("router-rtp-capabilities", response);
 
   updatePeers(roomId);
 
-  setSocketHandlersForPeer(socket, roomId);
+  setSocketHandlersForRoom(socket, userId, roomId, room);
 
   socket.join(`room:${roomId}`);
 }
@@ -269,29 +396,20 @@ function userIdFromSocket(socket: SocketIO.Socket): number {
   }
 }
 
-function setSocketHandlersForPeer(socket: SocketIO.Socket, roomId: string) {
-  // --> /signaling/leave
-  //
-  // removes the peer from the roomState data structure and and closes
-  // all associated mediasoup objects
-  //
-  socket.on('leave', withAsyncSocketHandler(async function(data) {
-    log('leave', socket.id);
-
-    await closePeer(roomId, socket.id);
-    updatePeers(roomId);
-
-    return ({ left: true });
-  }));
+function setSocketHandlersForRoom(socket: SocketIO.Socket, userId: number, roomId: string, room: Room) {
 
   socket.on('disconnect', () => {
+    // Remove all event handlers to prevent memory leaks
+    socket.removeAllListeners();
+
+    console.log("cleanup disconnect handler")
+
     closePeer(roomId, socket.id).then(() => {
       updatePeers(roomId);
     }, (error) => {
       console.error(error);
       Sentry.captureException(error);
-    })
-    
+    }) 
   });
 
   socket.on('chat-message', (data: object) => {
@@ -310,11 +428,6 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, roomId: string) {
   socket.on('create-transport', withAsyncSocketHandler(async (data) => {
     const request = protocol.createTransportRequest(data);
     log('create-transport', socket.id, request.direction);
-
-    if (!(roomId in roomState)) {
-      throw new Error(`No room ${roomId}`);
-    }
-    const room = roomState[roomId];
 
     let transport = await createWebRtcTransport({ router: room.router, peerId: socket.id, direction: request.direction });
     room.transports[transport.id] = transport;
@@ -336,12 +449,8 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, roomId: string) {
   //
   socket.on('connect-transport', withAsyncSocketHandler(async (data) => {
     const { transportId, dtlsParameters } = protocol.connectTransportRequest(data);
-  
-    if (!(roomId in roomState)) {
-      throw new Error(`No room ${roomId}`);
-    }
 
-    const transport = roomState[roomId].transports[transportId];
+    const transport = room.transports[transportId];
     if (transport == null) {
       throw new Error(`connect-transport: server-side transport ${transportId} not found`);
     }
@@ -363,13 +472,9 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, roomId: string) {
   socket.on('close-transport', withAsyncSocketHandler(async (data) => {
     const { transportId } = protocol.closeTransportRequest(data);
 
-    if (!(roomId in roomState)) {
-      throw new Error(`No room ${roomId}`);
-    }
+    const transport = room.transports[transportId];
 
-    const transport = roomState[roomId].transports[transportId];
-
-    if (roomState[roomId].transports[transportId]) {
+    if (room.transports[transportId]) {
       throw new Error(`close-transport: server-side transport ${transportId} not found`);
     }
 
@@ -389,11 +494,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, roomId: string) {
   socket.on('close-producer', withAsyncSocketHandler(async (data) => {
     const { producerId } = protocol.closeProducerRequest(data);
 
-    if (!(roomId in roomState)) {
-      throw new Error(`No room ${roomId}`);
-    }
-
-    const producer = roomState[roomId].producers.find((p) => p.id === producerId);
+    const producer = room.producers.find((p) => p.id === producerId);
 
     if (!producer) {
       throw new Error(`close-producer: server-side producer ${producerId} not found`);
@@ -416,11 +517,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, roomId: string) {
     console.log("send-track");
     const { transportId, kind, rtpParameters, paused, appData } = protocol.sendTrackRequest(data);
 
-    if (!(roomId in roomState)) {
-      throw new Error(`No room ${roomId}`);
-    }
-
-    const transport = roomState[roomId].transports[transportId];
+    const transport = room.transports[transportId];
 
     if (!transport) {
       throw new Error(`send-track: server-side transport ${transportId} not found`);
@@ -440,14 +537,22 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, roomId: string) {
       closeProducer(roomId, producer);
     });
 
-    roomState[roomId].producers.push(producer);
-    roomState[roomId].peers[socket.id].media[appData.mediaTag] = {
+    room.producers.push(producer);
+    room.peers[socket.id].media[appData.mediaTag] = {
       paused,
       // @ts-ignore
       encodings: rtpParameters.encodings
     };
 
     updatePeers(roomId);
+
+    if (appData.recording && mediaProcessorSocketId) {
+      io.to(mediaProcessorSocketId).emit("start-recording", {
+        roomId: roomId,
+        producerId: producer.id,
+        userId
+      });
+    }
 
     return { id: producer.id };
   }));
@@ -461,11 +566,6 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, roomId: string) {
   //
   socket.on('recv-track', withAsyncSocketHandler(async (data) => {
     const { mediaPeerId, mediaTag, rtpCapabilities } = protocol.recvTrackRequest(data);
-
-    if (!(roomId in roomState)) {
-      throw new Error(`No room ${roomId}`);
-    }
-    const room = roomState[roomId];
 
     const producer = room.producers.find(
       (p) => p.appData.mediaTag === mediaTag &&
@@ -548,11 +648,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, roomId: string) {
   socket.on('pause-consumer', withAsyncSocketHandler(async (data) => {
     const { consumerId } = protocol.pauseConsumerRequest(data);
 
-    if (!(roomId in roomState)) {
-      throw new Error(`No room ${roomId}`);
-    }
-
-    const consumer = roomState[roomId].consumers.find((c) => c.id === consumerId);
+    const consumer = room.consumers.find((c) => c.id === consumerId);
 
     if (!consumer) {
       throw new Error(`pause-consumer: server-side consumer ${consumerId} not found`);
@@ -572,15 +668,10 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, roomId: string) {
   //
   socket.on('resume-consumer', withAsyncSocketHandler(async (data) => {
     const { consumerId } = protocol.resumeConsumerRequest(data);
-
-    if (!(roomId in roomState)) {
-      throw new Error(`No room ${roomId}`);
-    }
-
-    const consumer = roomState[roomId].consumers.find((c) => c.id === consumerId);
+    const consumer = room.consumers.find((c) => c.id === consumerId);
 
     if (!consumer) {
-      throw new Error(`pause-consumer: server-side consumer ${consumerId} not found`);
+      throw new Error(`resume-consumer: server-side consumer ${consumerId} not found`);
     }
 
     log('resume-consumer', consumer.appData);
@@ -598,11 +689,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, roomId: string) {
   socket.on('close-consumer', withAsyncSocketHandler(async (data) => {
     const { consumerId } = protocol.closeConsumerRequest(data);
 
-    if (!(roomId in roomState)) {
-      throw new Error(`No room ${roomId}`);
-    }
-
-    const consumer = roomState[roomId].consumers.find((c) => c.id === consumerId);
+    const consumer = room.consumers.find((c) => c.id === consumerId);
 
     if (!consumer) {
       throw new Error(`close-consumer: server-side consumer ${consumerId} not found`);
@@ -620,12 +707,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, roomId: string) {
   //
   socket.on('consumer-set-layers', withAsyncSocketHandler(async (data) => {
     const { consumerId, spatialLayer } = data;
-
-    if (!(roomId in roomState)) {
-      throw new Error(`No room ${roomId}`);
-    }
-
-    const consumer = roomState[roomId].consumers.find((c) => c.id === consumerId);
+    const consumer = room.consumers.find((c) => c.id === consumerId);
 
     if (!consumer) {
       throw new Error(`consumer-set-layers: server-side consumer ${consumerId} not found`);
@@ -645,11 +727,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, roomId: string) {
   socket.on('pause-producer', withAsyncSocketHandler(async (data) => {
     const { producerId } = protocol.pauseProducerRequest(data);
 
-    if (!(roomId in roomState)) {
-      throw new Error(`No room ${roomId}`);
-    }
-
-    const producer = roomState[roomId].producers.find((p) => p.id === producerId);
+    const producer = room.producers.find((p) => p.id === producerId);
 
     if (!producer) {
       throw new Error(`pause-producer: server-side producer ${producerId} not found`);
@@ -675,11 +753,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, roomId: string) {
   socket.on('resume-producer', withAsyncSocketHandler(async (data) => {
     const { producerId } = protocol.resumeProducerRequest(data);
 
-    if (!(roomId in roomState)) {
-      throw new Error(`No room ${roomId}`);
-    }
-
-    const producer = roomState[roomId].producers.find((p) => p.id === producerId);
+    const producer = room.producers.find((p) => p.id === producerId);
 
     if (!producer) {
       throw new Error(`resume-producer: server-side producer ${producerId} not found`);
@@ -689,11 +763,7 @@ function setSocketHandlersForPeer(socket: SocketIO.Socket, roomId: string) {
 
     await producer.resume();
 
-    if (roomState[roomId]) {
-      roomState[roomId].peers[socket.id].media[producer.appData.mediaTag].paused = false;
-    } else {
-      console.warn(`resume-producer unable to find roomId ${roomId}`);
-    }
+    room.peers[socket.id].media[producer.appData.mediaTag].paused = false;
 
     return ({ resumed: true });
   }));
@@ -798,6 +868,13 @@ async function closeTransport(roomId: string, transport: Transport) {
 }
 
 async function closeProducer(roomId: string, producer: Producer) {
+  if (producer.appData.recording && mediaProcessorSocketId) {
+    io.to(mediaProcessorSocketId).emit("stop-recording", {
+      roomId: roomId,
+      producerId: producer.id
+    });
+  }
+
   log('closing producer', producer.id, producer.appData);
   await producer.close();
 

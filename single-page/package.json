@@ -14,6 +14,7 @@
     "@sentry/node": "^5.24.2",
     "decoders": "^1.23.2",
     "deep-equal": "^1.0.1",
+    "dotenv": "^8.2.0",
     "express": "^4.17.1",
     "mediasoup": "^3.1.5",
     "mediasoup-client": "^3.1.6",

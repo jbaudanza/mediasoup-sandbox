@@ -41,7 +41,7 @@ export const sendTrackRequest = guard(object({
   kind: mediaKind,
   rtpParameters: jsonObject,
   paused: boolean,
-  appData: object({ mediaTag: string })
+  appData: object({ mediaTag: string, recording: boolean })
 }));
 
 export const sendTrackResponse = guard(object({ 
@@ -84,4 +84,23 @@ export const resumeProducerRequest = guard(object({
 
 export const closeProducerRequest = guard(object({
   producerId: string
+}));
+
+
+//
+// The following is used for the media processor
+//
+export const createPlainTransportRequest = guard(object({ roomId: string, ipAddress: string, rtpPort: number, rtcpPort: number }));
+export const createPlainTransportResponse = guard(object({
+  id: string
+}));
+
+export const recvRtpTrackRequest = guard(object({ 
+  roomId: string,
+  transportId: string,
+  producerId: string,
+}));
+export const recvRtpTrackResponse = guard(object({
+  id: string,
+  rtpParameters: jsonObject
 }));
