@@ -15,7 +15,7 @@
   "dependencies": {
     "@sentry/node": "^5.27.2",
     "aws-sdk": "^2.783.0",
-    "beamcoder": "^0.6.10",
+    "beamcoder": "jbaudanza/beamcoder",
     "dotenv": "^8.2.0",
     "jsonwebtoken": "^8.5.1",
     "socket.io-client": "^2.3.1"

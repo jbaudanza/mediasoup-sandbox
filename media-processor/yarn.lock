@@ -132,10 +132,9 @@ base64-js@^1.0.2:
   resolved "https://registry.yarnpkg.com/base64-js/-/base64-js-1.3.1.tgz#58ece8cb75dd07e71ed08c736abc5fac4dbf8df1"
   integrity sha512-mLQ4i2QO1ytvGWFWmcngKO//JXAQueZvwEKtjgQFM4jIK0kU+ytMfplL8j+n5mspOfjHwoAg+9yhb7BwAHm36g==
 
-beamcoder@^0.6.10:
+beamcoder@jbaudanza/beamcoder:
   version "0.6.10"
-  resolved "https://registry.yarnpkg.com/beamcoder/-/beamcoder-0.6.10.tgz#30c02ab3838c1fe534a24d47ea03cab836637f29"
-  integrity sha512-xQPBpW19L9sR5C1Q14LELkjCnuk6xbjn+zi2+5fRhJpkHjAp2WJkqwYJseDumu8vTmslzPk3V1mtIZ19pFONyw==
+  resolved "https://codeload.github.com/jbaudanza/beamcoder/tar.gz/4b4d1cada9dfae692304eacad24f0df1c9198c30"
   dependencies:
     bindings "^1.5.0"
     segfault-handler "^1.3.0"

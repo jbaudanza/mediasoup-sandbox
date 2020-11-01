@@ -119,7 +119,7 @@ socket.on(
     console.log("stop-recording", producerId);
     const demuxer = demuxers[producerId];
     if (demuxer) {
-      //demuxer.forceClose();
+      demuxer.interrupt();
     } else {
       console.warn("Unknown producerId " + producerId);
     }
@@ -230,12 +230,17 @@ async function startRecordingProcess(demuxer: Demuxer, props: RecordingProps) {
     try {
       packet = await demuxer.read();
     } catch (error) {
-      console.log("demuxer error", error);
+      // This is the string version of AVERROR_EXIT from ffmpeg. Unfortunately, beamcoder doesn't
+      // expose error codes directly, so we have to do a string match.
+      // This error is expected to be thrown when demuxer.interrupt() is caled.
+      if (error.message.indexOf("Immediate exit requested") === -1) {
+        console.error(error);
+        captureException(error);
+      }
       break;
     }
 
     if (packet == null) break;
-    console.log("packet");
     await muxer.writeFrame(packet);
   }
 
