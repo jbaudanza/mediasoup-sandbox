@@ -71,21 +71,12 @@ socket.on(
     const rtpPort = choosePort();
     const rtcpPort = choosePort();
 
-    const { transportId, ipAddress: remoteIpAddress } = await makeRequest(
-      "create-plain-transport",
-      {
-        ipAddress,
-        rtpPort,
-        rtcpPort,
-        roomId,
-      },
-    );
-
-    // TODO: Possible to combine this with create-plain-transport message?
-    const { consumerId, rtpParameters } = await makeRequest("recv-track", {
+    const { rtpParameters, ipAddress: remoteIpAddress } = await makeRequest("recv-track", {
       roomId,
+      ipAddress,
+      rtpPort,
+      rtcpPort,
       producerId,
-      transportId,
     });
 
     const props = {
@@ -99,12 +90,7 @@ socket.on(
 
     console.log(`Opening RTP connection for ${producerId} on port ${rtpPort}`);
 
-    // TODO: demuxer gets initialize much faster if the RTP packets are already flowing
-    // If so, what's the point of having a resume-consumer?
-    const demuxerPromise = createRTPDemuxer(props);
-    makeRequest("resume-consumer", { consumerId });
-
-    const demuxer = await demuxerPromise;
+    const demuxer = await createRTPDemuxer(props);
 
     demuxers[producerId] = demuxer;
 

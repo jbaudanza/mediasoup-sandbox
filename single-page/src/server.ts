@@ -249,8 +249,8 @@ async function setSocketHandlersForMediaProcessor(socket: SocketIO.Socket) {
     socket.removeAllListeners();
   });
 
-  socket.on('create-plain-transport', withAsyncSocketHandler(async (data) => {
-    const request = protocol.createPlainTransportRequest(data);
+  socket.on('recv-track', withAsyncSocketHandler(async (data) => {
+    const request = protocol.recvRtpTrackRequest(data);
 
     const room = roomState[request.roomId];
     if (room == null) {
@@ -287,30 +287,10 @@ async function setSocketHandlersForMediaProcessor(socket: SocketIO.Socket) {
       transport.tuple.protocol
     );
 
-    const ipAddress = (listenIp.ip || listenIp.announcedIp);
-    return { transportId: transport.id, ipAddress  };
-  }));
-
-
-  // TODO: Do it make sense to merge this with create-plain-transport?
-  // Would you ever reusing an RTP transport? I don't think so
-  socket.on('recv-track', withAsyncSocketHandler(async (data) => {
-    const request = protocol.recvRtpTrackRequest(data);
-
-    const room = roomState[request.roomId];
-    if (room == null) {
-      throw Error(`No such room ${request.roomId}`)
-    }
-
-    const transport = transports[request.transportId];
-    if (transport == null) {
-      throw Error(`No such transport ${request.transportId}`) 
-    }
-
     const consumer = await transport.consume({
       producerId: request.producerId,
       rtpCapabilities: room.router.rtpCapabilities, // Assume the recorder supports same formats as mediasoup's router
-      paused: true
+      paused: false
     });
 
     consumers[consumer.id] = consumer;
@@ -321,23 +301,12 @@ async function setSocketHandlersForMediaProcessor(socket: SocketIO.Socket) {
       consumer.type
     );
 
+    const ipAddress = (listenIp.ip || listenIp.announcedIp);
+
     return {
-      consumerId: consumer.id,
+      ipAddress: ipAddress,
       rtpParameters: consumer.rtpParameters
     }
-  }));
-
-  socket.on('resume-consumer', withAsyncHandler(async (data) => {
-    const { consumerId } = protocol.resumeConsumerRequest(data);
-
-    const consumer = consumers[consumerId];
-    if (consumer == null) {
-      throw new Error(`server-side consumer ${consumerId} not found`);
-    }
-
-    await consumer.resume();
-
-    return { resumed: true };
   }));
 
   mediaProcessorSocketId = socket.id;

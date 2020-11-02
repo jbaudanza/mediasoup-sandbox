@@ -90,17 +90,14 @@ export const closeProducerRequest = guard(object({
 //
 // The following is used for the media processor
 //
-export const createPlainTransportRequest = guard(object({ roomId: string, ipAddress: string, rtpPort: number, rtcpPort: number }));
-export const createPlainTransportResponse = guard(object({
-  id: string
-}));
-
 export const recvRtpTrackRequest = guard(object({ 
   roomId: string,
-  transportId: string,
   producerId: string,
+  ipAddress: string,
+  rtpPort: number,
+  rtcpPort: number
 }));
 export const recvRtpTrackResponse = guard(object({
-  id: string,
+  ipAddress: string,
   rtpParameters: jsonObject
 }));
