@@ -243,7 +243,18 @@ async function setSocketHandlersForMediaProcessor(socket: SocketIO.Socket) {
     console.log("Disconnection from media processor");
     mediaProcessorSocketId = null;
     
-    // TODO: Close all transports and consumers
+    // Close all transports and remove it from the transport map. This will implicitly close
+    // the consumers
+    for (let [id, transport] of Object.entries(transports)) {
+      transport.close();
+      delete transports[id];
+    }
+
+    // There's no need to close the consumers, since we already closed the transports.
+    // But we empty out the consumer map
+    for (let id of Object.keys(consumers)) {
+      delete consumers[id];
+    }
 
     // Remove all event handlers to prevent memory leaks
     socket.removeAllListeners();
@@ -291,6 +302,18 @@ async function setSocketHandlersForMediaProcessor(socket: SocketIO.Socket) {
       producerId: request.producerId,
       rtpCapabilities: room.router.rtpCapabilities, // Assume the recorder supports same formats as mediasoup's router
       paused: false
+    });
+
+    consumer.on("producerclose", function() {
+      socket.emit("stop-recording", {
+        roomId: request.roomId,
+        producerId: request.producerId
+      });
+
+      delete consumers[consumer.id];
+      delete transports[transport.id];
+
+      transport.close();
     });
 
     consumers[consumer.id] = consumer;
@@ -837,13 +860,6 @@ async function closeTransport(roomId: string, transport: Transport) {
 }
 
 async function closeProducer(roomId: string, producer: Producer) {
-  if (producer.appData.recording && mediaProcessorSocketId) {
-    io.to(mediaProcessorSocketId).emit("stop-recording", {
-      roomId: roomId,
-      producerId: producer.id
-    });
-  }
-
   log('closing producer', producer.id, producer.appData);
   await producer.close();
 
