@@ -31,6 +31,7 @@ import type { Producer } from "mediasoup/lib/Producer";
 import type { Transport } from "mediasoup/lib/Transport";
 import type { Router } from "mediasoup/lib/Router";
 import type { Worker } from "mediasoup/lib/Worker";
+import type { AudioLevelObserver, AudioLevelObserverVolume } from "mediasoup/lib/AudioLevelObserver";
 
 import type { Socket } from "socket.io";
 
@@ -44,6 +45,7 @@ type Room = {
   transports: {[key: string]: Transport },
   producers: Array<Producer>,
   consumers: Array<Consumer>,
+  audioLevelObserver: AudioLevelObserver,
   router: Router
 };
 
@@ -122,7 +124,7 @@ let io: SocketIO.Server;
 
 function updatePeers(roomId: string) {
   if (roomId in roomState) {
-    io.to(`room:${roomId}`).emit("peers", {
+    emitToRoom(roomId, "peers", {
       peers: roomState[roomId].peers
     });
   }
@@ -204,6 +206,10 @@ async function main() {
 }
 
 import type { GuardType } from "decoders";
+
+function emitToRoom(roomId: string, eventName: string, data: object) {
+  io.to(`room:${roomId}`).emit(eventName, data);
+}
 
 async function setSocketHandlers(socket: SocketIO.Socket) {
   function logSocket(msg: string) {
@@ -353,8 +359,25 @@ async function setSocketHandlersForUser(socket: SocketIO.Socket) {
     // Create a new room with a new router
     const mediaCodecs = config.mediasoup.router.mediaCodecs;
     const router = await worker.createRouter({ mediaCodecs });
+    const audioLevelObserver = await router.createAudioLevelObserver({
+      interval: 500,
+      maxEntries: 10
+    });
 
-    roomState[roomId] = Object.assign({ router }, emptyRoom);
+    audioLevelObserver.on("volumes", (volumes: Array<AudioLevelObserverVolume>) => {
+      const message = volumes.map(v => ({
+        producerId: v.producer.id,
+        volume:  v.volume
+      }));
+
+      emitToRoom(roomId, "volumes", message);
+    });
+
+    audioLevelObserver.on("silence", () => {
+      emitToRoom(roomId, "silence", {});
+    });
+
+    roomState[roomId] = Object.assign({ router, audioLevelObserver }, emptyRoom);
   }
   const room = roomState[roomId];
 
@@ -405,11 +428,11 @@ function setSocketHandlersForRoom(socket: SocketIO.Socket, userId: number, roomI
   });
 
   socket.on('chat-message', (data: object) => {
-    io.to(`room:${roomId}`).emit('chat-message', {
+    emitToRoom(roomId, "chat-message", {
       timestamp: Date.now(),
       userId: userIdFromSocket(socket),
       body: data
-    });    
+    });
   });
 
   // --> /signaling/create-transport
@@ -535,6 +558,8 @@ function setSocketHandlersForRoom(socket: SocketIO.Socket, userId: number, roomI
       // @ts-ignore
       encodings: rtpParameters.encodings
     };
+
+    room.audioLevelObserver.addProducer({ producerId: producer.id })
 
     updatePeers(roomId);
 
