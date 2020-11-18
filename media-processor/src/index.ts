@@ -6,6 +6,9 @@ const SocketIO = require("socket.io-client");
 const jsonwebtoken = require("jsonwebtoken");
 const speech = require('@google-cloud/speech');
 
+import { ApiError as GoogleApiError } from "@google-cloud/common";
+import { Status as GoogleStatus } from "google-gax";
+
 import type { Demuxer } from "beamcoder";
 
 import { captureException, init as SentryInit } from "@sentry/node";
@@ -222,10 +225,10 @@ async function startRecordingProcess(demuxer: Demuxer, props: RecordingProps) {
   startTranscriptions(
     muxerStream,
     { channelCount: stream.codecpar.channels, sampleRate: stream.codecpar.sample_rate },
-    "en-US"
-  ).on("data", (recognizeResponse: any) => {
-    logRecognizeResponse(recognizeResponse);
-    socket.emit("recognize-response", { producerId: props.producerId, recognizeResponse })
+    "en-US",
+    (recognizeResponse: any) => {
+      logRecognizeResponse(recognizeResponse);
+      socket.emit("recognize-response", { producerId: props.producerId, recognizeResponse })
   });
 
   // This is a wrapper around avio_open2
@@ -257,7 +260,11 @@ async function startRecordingProcess(demuxer: Demuxer, props: RecordingProps) {
   await muxer.writeTrailer();
 }
 
-function startTranscriptions(readableStream: NodeJS.ReadableStream, opusHeaderProps: OpusHeaderProps, languageCode: string) {
+function startTranscriptions(
+    readableStream: NodeJS.ReadableStream,
+    opusHeaderProps: OpusHeaderProps,
+    languageCode: string,
+    onResponse: (data: any) => void) {
   const streamingRecognizeRequest = {
     config: {
       languageCode,
@@ -269,16 +276,87 @@ function startTranscriptions(readableStream: NodeJS.ReadableStream, opusHeaderPr
     interimResults: true,
   };
 
-  const recognizeStream = speechClient
-    .streamingRecognize(streamingRecognizeRequest)
-    .on('error', (error: Error) => {
-      // TODO: Stop sending data from the muxer
-      console.error(error);
+  function go() {
+    console.log(`Starting recognizeRequest for ${languageCode}`);
+
+    function dataListener(data: any) {
+      onResponse(data);
+    }
+
+    function errorListener(error: Error) {
+      // https://cloud.google.com/speech-to-text/docs/reference/rpc/google.rpc#google.rpc.Code
+      if (error instanceof GoogleApiError && error.code === GoogleStatus.OUT_OF_RANGE) {
+        // OUT_OF_RANGE (11) Error
+        //   - Raised when the stream extends beyond 305 seconds
+        //   - Raised if the stream goes too long without audio
+        //
+        // The correct behavior here is to restart the stream.
+
+        // TODO: Try waiting for a silence in conversation, and restarting the stream after 3-4 minutes.
+        // This may result in a better user experience
+        console.log(`OUT_OF_RANGE error from RecognizeStream. Restarting. message=${error.message}`)
+        go();
+      } else {
+        // TODO: Stop sending data from the muxer
+        console.error(error);
+        captureException(error);
+      }
+
+      removeListeners();
+    }
+
+    const recognizeStream = speechClient
+      .streamingRecognize(streamingRecognizeRequest)
+      .on("data", dataListener)
+      .on("error", errorListener);
+
+    readableStream.on("error", () => {
+      console.log("Ending recognizeStream because of error from muxer")
+      recognizeStream.end();
+      removeListeners();
     });
 
-  // TODO: When the muxer ends or has an error. We should close the recognize stream
+    //
+    // Hook the muxer up to the recognize stream. You should be able to make this work with
+    // readableStream.pipe(), but for some reason I couldn't get it to restart correctly
+    // after an OUT_OF_RANGE error.
+    //
+    let counter = 0;
+    let counter2 = 0;
+    function muxerDataListener(buffer: any) {
+      counter++;
+      counter2++;
+      if (counter > 100) {
+        console.log("100 packets");
+        counter = 0;
+      }
+      if (counter2 >= 0) {
+        recognizeStream.write(buffer);
+      }
+    }
+    function muxerErrorListener() {
+      recognizeStream.end();
+    }
+    function muxerEndListener() {
+      recognizeStream.end();
+    }
 
-  return readableStream.pipe(recognizeStream);
+    readableStream.on('data', muxerDataListener);
+    readableStream.on('error', muxerErrorListener);
+    readableStream.on('end', muxerEndListener);
+
+    function removeListeners() {
+      recognizeStream.removeListener("data", dataListener);
+      recognizeStream.removeListener("error", errorListener);
+      recognizeStream.destroy(); // TODO: I don't thin I need this
+
+      readableStream.removeListener("data", muxerDataListener);
+      readableStream.removeListener("error", muxerErrorListener);
+      readableStream.removeListener("end", muxerEndListener);
+    }
+  }
+
+  go();
 }
 
 function uploadToS3(readableStream: NodeJS.ReadableStream, mimeType: string, producerId: string): Promise<any> {
