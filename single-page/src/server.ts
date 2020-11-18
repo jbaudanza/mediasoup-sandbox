@@ -229,6 +229,7 @@ async function setSocketHandlers(socket: SocketIO.Socket) {
   if (socket.decoded_token.service === "media-processing") {
     setSocketHandlersForMediaProcessor(socket);
   } else {
+    //@ts-ignore missing definitions for decoded_token
     logSocket(`user_id=${socket.decoded_token.sub}`);
     setSocketHandlersForUser(socket);
   }
