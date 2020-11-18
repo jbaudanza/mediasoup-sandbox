@@ -183,12 +183,18 @@ async function createRTPDemuxer(props: RecordingProps): Promise<Demuxer> {
   return demuxer;
 }
 
+// Create a streaming muxer and connect it to S3
+// https://github.com/Streampunk/beamcoder#muxer-stream
 async function startRecordingProcess(demuxer: Demuxer, props: RecordingProps) {
-  // Create a streaming muxer and connect it to S3
-  // https://github.com/Streampunk/beamcoder#muxer-stream
 
-  //const highwaterMark = 65536;
-  const highwaterMark = 2048; // TODO: consider calling flush after each packet read
+  // The way governor.cc and adapter.h are written, buffers won't
+  // get emitted until this highwaterMark is reached.
+  // 64 seems to be the magic number that will release a buffer after every frame
+  // is written.
+  // Ideally, setting a highwaterMark shouldn't be necessary at all. It's just and odd
+  // requirement from beamcoder.
+  const highwaterMark = 64;
+
   const muxerStream = beamcoder.muxerStream({ highwaterMark });
 
   muxerStream.on("error", (error: Error) => {
@@ -202,6 +208,11 @@ async function startRecordingProcess(demuxer: Demuxer, props: RecordingProps) {
 
   const muxer = muxerStream.muxer({ format_name: "opus" });
   muxer.flush_packets = 1;
+
+  // This forces beamcoder to use av_write_frame instead of av_interleaved_write_frame. This is
+  // necessary to get the muxer to flush the packets right away. Also, we're only muxing
+  // one stream (Opus) so interleaving shouldn't be necessary.
+  muxer.interleaved = false;
 
   const stream = muxer.newStream(demuxer.streams[0]);
 
@@ -218,14 +229,10 @@ async function startRecordingProcess(demuxer: Demuxer, props: RecordingProps) {
   });
 
   // This is a wrapper around avio_open2
-  //await muxer.openIO({ url: '', flags: { DIRECT: true } });
   await muxer.openIO();
 
   // NOTE: If this throws "no extradata present", it's because the OPUS header is missing in extradata
   // This is a wrapper around avformat_write_header()
-  // await muxer.writeHeader({
-  //   options: { flags: { AVFMT_NOFILE: true }, fflags: 'flush_packets' }
-  // });
   await muxer.writeHeader();
 
   while (true) {
@@ -251,16 +258,6 @@ async function startRecordingProcess(demuxer: Demuxer, props: RecordingProps) {
 }
 
 function startTranscriptions(readableStream: NodeJS.ReadableStream, opusHeaderProps: OpusHeaderProps, languageCode: string) {
-
-  // if (muxer.streams.length !== 1) {
-  //   throw new Error(`Unexpected number of streams in muxer object: ${muxer.streams.length}`);
-  // }
-
-  // const codecpar = muxer.streams[0].codecpar;
-  // if (codecpar.name !== "opus") {
-  //   throw new Error(`Expected an opus stream in the muxer, but instead got ${codecpar.name}`);
-  // }
-
   const streamingRecognizeRequest = {
     config: {
       languageCode,
@@ -282,18 +279,6 @@ function startTranscriptions(readableStream: NodeJS.ReadableStream, opusHeaderPr
   // TODO: When the muxer ends or has an error. We should close the recognize stream
 
   return readableStream.pipe(recognizeStream);
-  // readableStream.on("data", (buffer) => {
-  //   console.log("sending data to google", buffer.length)
-  //   recognizeStream.write(buffer);
-  // });
-
-  // readableStream.on("readable", () => {
-  //   const buffer = readableStream.read();
-  //   if (buffer != null) {
-  //     console.log("sending data to google", buffer.length)
-  //     recognizeStream.write(buffer);
-  //   }
-  // });
 }
 
 function uploadToS3(readableStream: NodeJS.ReadableStream, mimeType: string, producerId: string): Promise<any> {
