@@ -4,12 +4,21 @@ const S3 = require("aws-sdk/clients/s3");
 const beamcoder = require("beamcoder");
 const SocketIO = require("socket.io-client");
 const jsonwebtoken = require("jsonwebtoken");
+const speech = require('@google-cloud/speech');
 
 import type { Demuxer } from "beamcoder";
 
 import { captureException, init as SentryInit } from "@sentry/node";
 
 SentryInit({ dsn: process.env["SENTRY_DSN"] });
+
+let clientOptions;
+if (process.env["GOOGLE_APPLICATION_CREDENTIALS_JSON"]) {
+  clientOptions = { credentials: JSON.parse(process.env["GOOGLE_APPLICATION_CREDENTIALS_JSON"]) };
+} else {
+  clientOptions = {};
+}
+const speechClient = new speech.SpeechClient(clientOptions);
 
 const s3 = new S3();
 
@@ -37,9 +46,6 @@ socket.on("error", (data: any) => {
   console.log("error", data);
 });
 
-socket.on("disconnect", () => {
-  console.log("disconnect");
-});
 socket.on("unauthorized", (msg: any) => {
   console.log("unauthorized", msg);
 });
@@ -112,10 +118,10 @@ socket.on(
   }),
 );
 
-socket.on("disconenct", () => {
-  console.log("disconnected");
+socket.on("disconnect", () => {
+  console.log("disconnect");
   for (let demuxer of Object.values(demuxers)) {
-    demuxer.forceClose();
+    demuxer.interrupt();
   }
   demuxers = {};
 });
@@ -141,14 +147,12 @@ type RecordingProps = {
 async function createRTPDemuxer(props: RecordingProps): Promise<Demuxer> {
   const sdp = createSDP(props);
 
-  console.log("creating demuxer");
   const demuxer = await beamcoder.demuxer({
     url: dataUrl(sdp),
     options: {
       protocol_whitelist: "data,rtp,udp",
     },
   });
-  console.log("finished");
 
   /*
     This is a bit of a hack.
@@ -182,7 +186,10 @@ async function createRTPDemuxer(props: RecordingProps): Promise<Demuxer> {
 async function startRecordingProcess(demuxer: Demuxer, props: RecordingProps) {
   // Create a streaming muxer and connect it to S3
   // https://github.com/Streampunk/beamcoder#muxer-stream
-  const muxerStream = beamcoder.muxerStream({ highwaterMark: 65536 });
+
+  //const highwaterMark = 65536;
+  const highwaterMark = 2048; // TODO: consider calling flush after each packet read
+  const muxerStream = beamcoder.muxerStream({ highwaterMark });
 
   muxerStream.on("error", (error: Error) => {
     console.log("Muxer error");
@@ -192,23 +199,33 @@ async function startRecordingProcess(demuxer: Demuxer, props: RecordingProps) {
   // Note: This will upload in chunks of 5mb. See the docs on `partSize`
   // https://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/S3/ManagedUpload.html#minPartSize-property
   const s3Key = props.producerId + ".opus";
-  console.log(`Starting S3 upload to ${s3Key}`);
-  const s3Upload = s3.upload({
-    Bucket: requireEnv("S3_BUCKET"),
-    Key: s3Key,
-    Body: muxerStream,
-    ContentType: props.codec.mimeType,
-  });
-
-  // Need to call promise to actually start the reading from muxerStream
-  const s3UploadPromise = s3Upload.promise();
 
   const muxer = muxerStream.muxer({ format_name: "opus" });
+  muxer.flush_packets = 1;
 
   const stream = muxer.newStream(demuxer.streams[0]);
+
+  // TODO: comment this back in
+  //uploadToS3(muxerStream, props.codec.mimeType, props.producerId);
+
+  startTranscriptions(
+    muxerStream,
+    { channelCount: stream.codecpar.channels, sampleRate: stream.codecpar.sample_rate },
+    "en-US"
+  ).on("data", (recognizeResponse: any) => {
+    logRecognizeResponse(recognizeResponse);
+    socket.emit("recognize-response", { producerId: props.producerId, recognizeResponse })
+  });
+
+  // This is a wrapper around avio_open2
+  //await muxer.openIO({ url: '', flags: { DIRECT: true } });
   await muxer.openIO();
 
   // NOTE: If this throws "no extradata present", it's because the OPUS header is missing in extradata
+  // This is a wrapper around avformat_write_header()
+  // await muxer.writeHeader({
+  //   options: { flags: { AVFMT_NOFILE: true }, fflags: 'flush_packets' }
+  // });
   await muxer.writeHeader();
 
   while (true) {
@@ -231,12 +248,78 @@ async function startRecordingProcess(demuxer: Demuxer, props: RecordingProps) {
   }
 
   await muxer.writeTrailer();
-
-  await s3Upload.promise();
-  console.log(`Finished S3 upload to ${s3Key}`);
 }
 
-function buildOpusHeader(props: { channelCount: number; sampleRate: number }): Buffer {
+function startTranscriptions(readableStream: NodeJS.ReadableStream, opusHeaderProps: OpusHeaderProps, languageCode: string) {
+
+  // if (muxer.streams.length !== 1) {
+  //   throw new Error(`Unexpected number of streams in muxer object: ${muxer.streams.length}`);
+  // }
+
+  // const codecpar = muxer.streams[0].codecpar;
+  // if (codecpar.name !== "opus") {
+  //   throw new Error(`Expected an opus stream in the muxer, but instead got ${codecpar.name}`);
+  // }
+
+  const streamingRecognizeRequest = {
+    config: {
+      languageCode,
+      enableWordTimeOffsets: true,
+      encoding: 'OGG_OPUS',
+      audioChannelCount: opusHeaderProps.channelCount,
+      sampleRateHertz: opusHeaderProps.sampleRate,
+    },
+    interimResults: true,
+  };
+
+  const recognizeStream = speechClient
+    .streamingRecognize(streamingRecognizeRequest)
+    .on('error', (error: Error) => {
+      // TODO: Stop sending data from the muxer
+      console.error(error);
+    });
+
+  // TODO: When the muxer ends or has an error. We should close the recognize stream
+
+  return readableStream.pipe(recognizeStream);
+  // readableStream.on("data", (buffer) => {
+  //   console.log("sending data to google", buffer.length)
+  //   recognizeStream.write(buffer);
+  // });
+
+  // readableStream.on("readable", () => {
+  //   const buffer = readableStream.read();
+  //   if (buffer != null) {
+  //     console.log("sending data to google", buffer.length)
+  //     recognizeStream.write(buffer);
+  //   }
+  // });
+}
+
+function uploadToS3(readableStream: NodeJS.ReadableStream, mimeType: string, producerId: string): Promise<any> {
+  const s3Key = producerId + ".opus";
+  console.log(`Starting S3 upload to ${s3Key}`);
+  const s3Upload = s3.upload({
+    Bucket: requireEnv("S3_BUCKET"),
+    Key: s3Key,
+    Body: readableStream,
+    ContentType: mimeType,
+  });
+
+  // Need to call promise to actually start the reading from muxerStream
+  const promise = s3Upload.promise();
+
+  promise.then(() => { console.log(`Finished S3 upload to ${s3Key}`); });
+
+  return promise;
+}
+
+type OpusHeaderProps = {
+  channelCount: number,
+  sampleRate: number,
+};
+
+function buildOpusHeader(props: OpusHeaderProps): Buffer {
   const buffer = Buffer.alloc(19);
 
   // Official description of header fields:
@@ -274,32 +357,6 @@ type Codec = {
   clockRate: number;
   channels: number;
   parameters: { [key: string]: number };
-};
-
-const testRtpParameters = {
-  codecs: [
-    {
-      mimeType: "audio/opus",
-      payloadType: 100,
-      clockRate: 48000,
-      channels: 2,
-      parameters: { minptime: 10, useinbandfec: 1 },
-      rtcpFeedback: [],
-    },
-  ],
-  headerExtensions: [
-    { uri: "urn:ietf:params:rtp-hdrext:sdes:mid", id: 1, encrypt: false, parameters: {} },
-    {
-      uri: "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time",
-      id: 4,
-      encrypt: false,
-      parameters: {},
-    },
-    { uri: "urn:ietf:params:rtp-hdrext:ssrc-audio-level", id: 10, encrypt: false, parameters: {} },
-  ],
-  encodings: [{ ssrc: 148802405 }],
-  rtcp: { cname: "nZ0lK3nvTuPqWxWA", reducedSize: true, mux: true },
-  mid: "0",
 };
 
 function createSDP({
@@ -361,4 +418,13 @@ if (minPort % 2 !== 0) {
 function choosePort() {
   const i = portCounter++;
   return minPort + (i % (maxPort - minPort + 1));
+}
+
+function logRecognizeResponse(response: any) {
+  if (Array.isArray(response.results)) {
+    const str = response.results.map((result: any) => {
+      return result.alternatives[0].transcript;
+    }).join(" ");
+    console.log("Transcript: " + str);
+  }
 }

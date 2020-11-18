@@ -216,8 +216,6 @@ async function setSocketHandlers(socket: SocketIO.Socket) {
     console.log(`[${new Date().toISOString()}] ${socket.handshake.address} ${socket.id} ${msg}`)
   }
 
-  logSocket("socketio connection");
-
   socket.on('disconnect', (reason) => {
     logSocket(`socketio disconnect: ${reason}`);
   });
@@ -231,6 +229,7 @@ async function setSocketHandlers(socket: SocketIO.Socket) {
   if (socket.decoded_token.service === "media-processing") {
     setSocketHandlersForMediaProcessor(socket);
   } else {
+    logSocket(`user_id=${socket.decoded_token.sub}`);
     setSocketHandlersForUser(socket);
   }
 }
@@ -244,6 +243,11 @@ async function setSocketHandlersForMediaProcessor(socket: SocketIO.Socket) {
   if (mediaProcessorSocketId != null) {
     console.warn(`"Media Processor already connected on socket ${mediaProcessorSocketId}`)
   }
+
+  socket.on("recognize-response", (data) => {
+    io.to(`producer:${data.producerId}`).emit("recognize-response", data.recognizeResponse);
+    //console.log(`sending recognize-response to producer:${data.producerId}`);
+  });
 
   socket.on('disconnect', () => {
     console.log("Disconnection from media processor");
@@ -584,14 +588,7 @@ function setSocketHandlersForRoom(socket: SocketIO.Socket, userId: number, roomI
   socket.on('recv-track', withAsyncSocketHandler(async (data) => {
     const { mediaPeerId, mediaTag, rtpCapabilities } = protocol.recvTrackRequest(data);
 
-    const producer = room.producers.find(
-      (p) => p.appData.mediaTag === mediaTag &&
-             p.appData.peerId === mediaPeerId
-    );
-
-    if (!producer) {
-      throw new Error('server-side producer for ' + `${mediaPeerId}:${mediaTag} not found`);
-    }
+    const producer = producerFromMediaTag(mediaPeerId, mediaTag);
 
     if (!room.router.canConsume({ producerId: producer.id, 
       // @ts-ignore
@@ -785,6 +782,47 @@ function setSocketHandlersForRoom(socket: SocketIO.Socket, userId: number, roomI
     return ({ resumed: true });
   }));
 
+  socket.on('start-transcribing', withAsyncSocketHandler(async (data) => {
+    //@ts-ignore missing definitions for decoded_token
+    const decoded_token = socket.decoded_token;
+    if (!decoded_token.transcriptions) {
+      throw new Error("JWT does not have a grant for transcriptions")
+    }
+
+    const request = protocol.startTranscribingRequest(data);
+
+    logSocket(`start-transcribing peerId=${request.peerId}`);
+
+    const producer = producerFromMediaTag(request.peerId, request.mediaTag);
+
+    socket.join(`producer:${producer.id}`)
+
+  }));
+
+  socket.on('stop-transcribing', withAsyncSocketHandler(async (data) => {
+    logSocket("stop-transcribing")
+    const request = protocol.stopTranscribingRequest(data);
+    const producer = producerFromMediaTag(request.peerId, request.mediaTag);
+    socket.leave(`producer:${producer.id}`)
+  }));
+
+  function producerFromMediaTag(peerId: string, mediaTag: string): Producer {
+    const producer = room.producers.find(
+      (p) => p.appData.mediaTag === mediaTag &&
+             p.appData.peerId === peerId
+    );
+
+    if (!producer) {
+      throw new Error('Producer for ' + `${peerId}:${mediaTag} not found`);
+    }
+
+    return producer;
+  }
+
+  function logSocket(msg: string) {
+    console.log(`[${new Date().toISOString()}] user_id=${userId} ${msg}`)
+  }
+
 }
 
 main().catch(console.error);
@@ -792,15 +830,19 @@ main().catch(console.error);
 function withAsyncSocketHandler(
   handler: (data: any) => Promise<any>
 ): (data: any, callback: (data: any) => void) => void {
-  return (data: any, callback: (data: any) => void) => {
+  return (data: any, callback: (data: any) => void | undefined) => {
     handler(data).then((result: any) => {
-      callback(result);
+      if (callback) {
+        callback(result);
+      }
     }
     ).catch((err: Error) => {
       const eventId = Sentry.captureException(err);
       console.warn(`Error raised (${eventId})`);
       console.error(err);
-      callback({error: err.message, eventId: eventId})
+      if (callback) {
+        callback({error: err.message, eventId: eventId})
+      }
     });
   }
 }

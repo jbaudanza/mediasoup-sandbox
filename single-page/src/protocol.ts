@@ -86,6 +86,15 @@ export const closeProducerRequest = guard(object({
   producerId: string
 }));
 
+export const startTranscribingRequest = guard(object({
+  peerId: string,
+  mediaTag: string
+}));
+
+export const stopTranscribingRequest = guard(object({
+  peerId: string,
+  mediaTag: string
+}));
 
 //
 // The following is used for the media processor
