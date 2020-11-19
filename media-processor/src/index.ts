@@ -74,7 +74,7 @@ function makeRequest(name: string, request: any): Promise<any> {
 socket.on(
   "start-recording",
   withErrorReporting(async (data) => {
-    const { userId, roomId, producerId } = data;
+    const { userId, roomId, producerId, nativeLang } = data;
 
     const ipAddress = "127.0.0.1"; // TODO: should come from a config somewhere
     const rtpPort = choosePort();
@@ -91,6 +91,7 @@ socket.on(
     const props = {
       userId,
       producerId,
+      nativeLang,
       rtpPort,
       rtcpPort,
       remoteIpAddress,
@@ -140,6 +141,7 @@ function withErrorReporting(fn: (data: any) => Promise<any>) {
 
 type RecordingProps = {
   userId: number;
+  nativeLang: string;
   producerId: string;
   codec: any;
   remoteIpAddress: string;
@@ -225,7 +227,7 @@ async function startRecordingProcess(demuxer: Demuxer, props: RecordingProps) {
   startTranscriptions(
     muxerStream,
     { channelCount: stream.codecpar.channels, sampleRate: stream.codecpar.sample_rate },
-    "en-US",
+    props.nativeLang,
     (recognizeResponse: any) => {
       logRecognizeResponse(recognizeResponse);
       socket.emit("recognize-response", { producerId: props.producerId, recognizeResponse })
@@ -429,6 +431,7 @@ function createSDP({
   rtpPort,
   rtcpPort,
   codec,
+  nativeLang,
 }: RecordingProps) {
   const match = codec.mimeType.match(/(\w+)\/(\w+)/);
   if (!match) {
@@ -449,6 +452,7 @@ s=Mediasoup
 c=IN IP4 ${remoteIpAddress}
 t=0 0
 m=${mediaType} ${rtpPort} RTP/AVPF ${codec.payloadType}
+a=lang:${nativeLang}
 a=rtcp:${rtcpPort}
 a=rtpmap:${codec.payloadType} ${codecName}/${codec.clockRate}/${codec.channels}
 a=fmtp:${codec.payloadType} ${fmtp}

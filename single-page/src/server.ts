@@ -572,7 +572,8 @@ function setSocketHandlersForRoom(socket: SocketIO.Socket, userId: number, roomI
       io.to(mediaProcessorSocketId).emit("start-recording", {
         roomId: roomId,
         producerId: producer.id,
-        userId
+        userId,
+        nativeLang: appData.nativeLang
       });
     }
 

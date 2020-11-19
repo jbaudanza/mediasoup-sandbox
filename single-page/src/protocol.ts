@@ -41,7 +41,7 @@ export const sendTrackRequest = guard(object({
   kind: mediaKind,
   rtpParameters: jsonObject,
   paused: boolean,
-  appData: object({ mediaTag: string, recording: boolean })
+  appData: object({ mediaTag: string, recording: boolean, nativeLang: string })
 }));
 
 export const sendTrackResponse = guard(object({ 
