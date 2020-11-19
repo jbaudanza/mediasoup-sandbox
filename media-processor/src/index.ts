@@ -6,10 +6,11 @@ const SocketIO = require("socket.io-client");
 const jsonwebtoken = require("jsonwebtoken");
 const speech = require('@google-cloud/speech');
 
+import { Readable, PassThrough } from "stream";
 import { ApiError as GoogleApiError } from "@google-cloud/common";
 import { Status as GoogleStatus } from "google-gax";
 
-import type { Demuxer } from "beamcoder";
+import type { Demuxer, Packet } from "beamcoder";
 
 import { captureException, init as SentryInit } from "@sentry/node";
 
@@ -104,7 +105,37 @@ socket.on(
 
     demuxers[producerId] = demuxer;
 
-    await startRecordingProcess(demuxer, props);
+    const packetStream = new PacketStreamFromDemuxer(demuxer);
+
+    // Do a deep clone of the stream config.
+    // This is necessary to prevent a crash during cleanup when two muxers are sharing the
+    // same config.
+    const streamConfig = JSON.parse(JSON.stringify(demuxer.streams[0]));
+
+    function readReadableStream() {
+      const pt = new PassThrough({ objectMode: true });
+      packetStream.pipe(pt);
+
+      const muxerStream = createOggMuxer(pt, streamConfig, props);
+
+      muxerStream.on('close', () => {
+        // Stop sending packets to the muxer and signal and end. This is necessary to get the muxer
+        // loop to cleanly exit
+        packetStream.unpipe(pt);
+        pt.end();
+      });
+
+      return muxerStream;
+    }
+
+    startTranscriptions(
+      readReadableStream,
+      { channelCount: streamConfig.codecpar.channels, sampleRate: streamConfig.codecpar.sample_rate },
+      props.nativeLang,
+      (recognizeResponse: any) => {
+        logRecognizeResponse(recognizeResponse);
+        //socket.emit("recognize-response", { producerId: props.producerId, recognizeResponse })
+    });
   }),
 );
 
@@ -188,9 +219,33 @@ async function createRTPDemuxer(props: RecordingProps): Promise<Demuxer> {
   return demuxer;
 }
 
-// Create a streaming muxer and connect it to S3
-// https://github.com/Streampunk/beamcoder#muxer-stream
-async function startRecordingProcess(demuxer: Demuxer, props: RecordingProps) {
+class PacketStreamFromDemuxer extends Readable {
+  constructor(demuxer: Demuxer) {
+    super({ objectMode: true });
+    this.demuxer = demuxer;
+  }
+
+  demuxer: Demuxer;
+
+  _read(n: number) {
+    this.demuxer.read().then((packet) => {
+      this.push(packet);
+    }, (error) => {
+      // This is the string version of AVERROR_EXIT from ffmpeg. Unfortunately, beamcoder doesn't
+      // expose error codes directly, so we have to do a string match.
+      // This error is expected to be thrown when demuxer.interrupt() is caled.
+      if (error.message.indexOf("Immediate exit requested") === -1) {
+        this.destroy(error);
+      } else {
+        // TODO: Should this also call destroy? Or close?,
+        // Otherwise a close event is never emitted
+        this.push(null);
+      }
+    });
+  }
+}
+
+function createOggMuxer(opusPackets: Readable, streamConfig: object, props: RecordingProps): Readable {
 
   // The way governor.cc and adapter.h are written, buffers won't
   // get emitted until this highwaterMark is reached.
@@ -202,15 +257,6 @@ async function startRecordingProcess(demuxer: Demuxer, props: RecordingProps) {
 
   const muxerStream = beamcoder.muxerStream({ highwaterMark });
 
-  muxerStream.on("error", (error: Error) => {
-    console.log("Muxer error");
-    console.error(error);
-  });
-
-  // Note: This will upload in chunks of 5mb. See the docs on `partSize`
-  // https://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/S3/ManagedUpload.html#minPartSize-property
-  const s3Key = props.producerId + ".opus";
-
   const muxer = muxerStream.muxer({ format_name: "opus" });
   muxer.flush_packets = 1;
 
@@ -219,51 +265,46 @@ async function startRecordingProcess(demuxer: Demuxer, props: RecordingProps) {
   // one stream (Opus) so interleaving shouldn't be necessary.
   muxer.interleaved = false;
 
-  const stream = muxer.newStream(demuxer.streams[0]);
+  const stream = muxer.newStream(streamConfig);
+
+  async function run() {
+    // This is a wrapper around avio_open2
+    await muxer.openIO();
+
+    // NOTE: If this throws "no extradata present", it's because the OPUS header is missing in extradata
+    // This is a wrapper around avformat_write_header()
+    await muxer.writeHeader();
+
+    for await (const packet of opusPackets) {
+      if (packet == null)
+        break;
+
+      // if (muxerStream.destroyed) {
+      //   console.log("muxer destroyed detected. breaking")
+      //   break;
+      // }
+
+      await muxer.writeFrame(packet);
+    }
+
+    await muxer.writeTrailer();
+    console.log("leaving muxer loop")
+  }
+
+  run().catch(error => {
+    // TODO: Do something with this?
+    console.error(error);
+  });
+
+  return muxerStream;
 
   // TODO: comment this back in
   //uploadToS3(muxerStream, props.codec.mimeType, props.producerId);
 
-  startTranscriptions(
-    muxerStream,
-    { channelCount: stream.codecpar.channels, sampleRate: stream.codecpar.sample_rate },
-    props.nativeLang,
-    (recognizeResponse: any) => {
-      logRecognizeResponse(recognizeResponse);
-      socket.emit("recognize-response", { producerId: props.producerId, recognizeResponse })
-  });
-
-  // This is a wrapper around avio_open2
-  await muxer.openIO();
-
-  // NOTE: If this throws "no extradata present", it's because the OPUS header is missing in extradata
-  // This is a wrapper around avformat_write_header()
-  await muxer.writeHeader();
-
-  while (true) {
-    let packet;
-    try {
-      packet = await demuxer.read();
-    } catch (error) {
-      // This is the string version of AVERROR_EXIT from ffmpeg. Unfortunately, beamcoder doesn't
-      // expose error codes directly, so we have to do a string match.
-      // This error is expected to be thrown when demuxer.interrupt() is caled.
-      if (error.message.indexOf("Immediate exit requested") === -1) {
-        console.error(error);
-        captureException(error);
-      }
-      break;
-    }
-
-    if (packet == null) break;
-    await muxer.writeFrame(packet);
-  }
-
-  await muxer.writeTrailer();
 }
 
 function startTranscriptions(
-    readableStream: NodeJS.ReadableStream,
+    createReadableStream: () => Readable,
     opusHeaderProps: OpusHeaderProps,
     languageCode: string,
     onResponse: (data: any) => void) {
@@ -278,14 +319,17 @@ function startTranscriptions(
     interimResults: true,
   };
 
+  let counter = 0;
+
   function go() {
     console.log(`Starting recognizeRequest for ${languageCode}`);
 
-    function dataListener(data: any) {
-      onResponse(data);
-    }
+    const readableStream = createReadableStream();
+    readableStream.counter = counter++;
 
     function errorListener(error: Error) {
+      removeListeners();
+
       // https://cloud.google.com/speech-to-text/docs/reference/rpc/google.rpc#google.rpc.Code
       if (error instanceof GoogleApiError && error.code === GoogleStatus.OUT_OF_RANGE) {
         // OUT_OF_RANGE (11) Error
@@ -303,8 +347,11 @@ function startTranscriptions(
         console.error(error);
         captureException(error);
       }
+      console.log(`Got here ${readableStream.counter}`)
+    }
 
-      removeListeners();
+    function dataListener(data: any) {
+      onResponse(data);
     }
 
     const recognizeStream = speechClient
@@ -312,47 +359,61 @@ function startTranscriptions(
       .on("data", dataListener)
       .on("error", errorListener);
 
-    readableStream.on("error", () => {
-      console.log("Ending recognizeStream because of error from muxer")
+    // TODO: Why doesn't the pipe work on reconnect?
+    readableStream.pipe(recognizeStream);
+
+    // let packetCounter = 0;
+    // function readableDataListener(packet) {
+    //   packetCounter++;
+    //   if (packetCounter > 200) {
+    //     console.log("200 ogg packets read from muxer");
+    //     packetCounter = 0;
+    //   }
+    //   recognizeStream.write(packet);
+    // }
+
+    // function readableEndListener() {
+    //   console.log("readableEndListener")
+    //   recognizeStream.end();
+    //   removeListeners();
+    // }
+
+    function readableErrorListener() {
+      console.log("readableErrorListener")
       recognizeStream.end();
       removeListeners();
-    });
-
-    //
-    // Hook the muxer up to the recognize stream. You should be able to make this work with
-    // readableStream.pipe(), but for some reason I couldn't get it to restart correctly
-    // after an OUT_OF_RANGE error.
-    //
-    function muxerDataListener(buffer: any) {
-      recognizeStream.write(buffer);
-    }
-    function muxerErrorListener() {
-      recognizeStream.end();
-    }
-    function muxerEndListener() {
-      recognizeStream.end();
     }
 
-    readableStream.on('data', muxerDataListener);
-    readableStream.on('error', muxerErrorListener);
-    readableStream.on('end', muxerEndListener);
+    //readableStream.on("data", readableDataListener);
+    //readableStream.on("end", readableEndListener);
+    readableStream.on("error", readableErrorListener);
+
+    console.log(`starting pipe for stream ${readableStream.counter} ${readableStream.readableFlowing}`)
 
     function removeListeners() {
+      console.log(`removing listeners for stream ${readableStream.counter}`)
       recognizeStream.removeListener("data", dataListener);
       recognizeStream.removeListener("error", errorListener);
 
-      readableStream.removeListener("data", muxerDataListener);
-      readableStream.removeListener("error", muxerErrorListener);
-      readableStream.removeListener("end", muxerEndListener);
+      //readableStream.removeListener("data", readableDataListener);
+      //readableStream.removeListener("end", readableEndListener);
+      readableStream.removeListener("error", readableErrorListener);
+      readableStream.unpipe(recognizeStream);
+
+      // TODO: Will this actually stop the muxer loop from running?
+      readableStream.destroy();
     }
   }
 
   go();
 }
 
-function uploadToS3(readableStream: NodeJS.ReadableStream, mimeType: string, producerId: string): Promise<any> {
+function uploadToS3(readableStream: Readable, mimeType: string, producerId: string): Promise<any> {
   const s3Key = producerId + ".opus";
   console.log(`Starting S3 upload to ${s3Key}`);
+
+  // Note: This will upload in chunks of 5mb. See the docs on `partSize`
+  // https://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/S3/ManagedUpload.html#minPartSize-property
   const s3Upload = s3.upload({
     Bucket: requireEnv("S3_BUCKET"),
     Key: s3Key,
