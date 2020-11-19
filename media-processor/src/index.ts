@@ -4,7 +4,7 @@ const S3 = require("aws-sdk/clients/s3");
 const beamcoder = require("beamcoder");
 const SocketIO = require("socket.io-client");
 const jsonwebtoken = require("jsonwebtoken");
-const speech = require('@google-cloud/speech');
+const speech = require("@google-cloud/speech");
 
 import { Readable, PassThrough } from "stream";
 import { ApiError as GoogleApiError } from "@google-cloud/common";
@@ -25,6 +25,18 @@ if (process.env["GOOGLE_APPLICATION_CREDENTIALS_JSON"]) {
 const speechClient = new speech.SpeechClient(clientOptions);
 
 const s3 = new S3();
+
+type StreamState = {
+  demuxer: Demuxer;
+
+  packetStream: Readable;
+
+  nativeLang: string;
+
+  // This is the PassThrough stream that is used to move packets from
+  // the RTP Demuxer to the current Transcription muxer.
+  passThroughForTranscriptions: PassThrough | null;
+};
 
 export function makeJWT(): string {
   const payload = { service: "media-processing" };
@@ -54,7 +66,7 @@ socket.on("unauthorized", (msg: any) => {
   console.log("unauthorized", msg);
 });
 
-let demuxers: { [producerId: string]: Demuxer } = {};
+let streamState: { [producerId: string]: StreamState } = {};
 
 function makeRequest(name: string, request: any): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -102,40 +114,18 @@ socket.on(
     console.log(`Opening RTP connection for ${producerId} on port ${rtpPort}`);
 
     const demuxer = await createRTPDemuxer(props);
-
-    demuxers[producerId] = demuxer;
-
     const packetStream = new PacketStreamFromDemuxer(demuxer);
 
-    // Do a deep clone of the stream config.
-    // This is necessary to prevent a crash during cleanup when two muxers are sharing the
-    // same config.
-    const streamConfig = JSON.parse(JSON.stringify(demuxer.streams[0]));
+    // TODO: If we start writing to S3 right away, this probably isn't necessary
+    packetStream.resume();
+    //uploadToS3(muxerStream, props.codec.mimeType, props.producerId);
 
-    function readReadableStream() {
-      const pt = new PassThrough({ objectMode: true });
-      packetStream.pipe(pt);
-
-      const muxerStream = createOggMuxer(pt, streamConfig, props);
-
-      muxerStream.on('close', () => {
-        // Stop sending packets to the muxer and signal and end. This is necessary to get the muxer
-        // loop to cleanly exit
-        packetStream.unpipe(pt);
-        pt.end();
-      });
-
-      return muxerStream;
-    }
-
-    startTranscriptions(
-      readReadableStream,
-      { channelCount: streamConfig.codecpar.channels, sampleRate: streamConfig.codecpar.sample_rate },
-      props.nativeLang,
-      (recognizeResponse: any) => {
-        logRecognizeResponse(recognizeResponse);
-        //socket.emit("recognize-response", { producerId: props.producerId, recognizeResponse })
-    });
+    streamState[producerId] = {
+      demuxer,
+      packetStream,
+      passThroughForTranscriptions: null,
+      nativeLang: props.nativeLang,
+    };
   }),
 );
 
@@ -144,21 +134,40 @@ socket.on(
   withErrorReporting(async (data) => {
     const { producerId } = data;
     console.log("stop-recording", producerId);
-    const demuxer = demuxers[producerId];
-    if (demuxer) {
-      demuxer.interrupt();
+    const state = streamState[producerId];
+    if (state) {
+      state.demuxer.interrupt();
+      delete streamState[producerId];
     } else {
       console.warn("Unknown producerId " + producerId);
     }
   }),
 );
 
+socket.on(
+  "start-transcribing",
+  withErrorReporting(async (data) => {
+    const { producerId } = data;
+    console.log("start-transcribing", producerId);
+    startTranscriptions(producerId);
+  }),
+);
+
+socket.on(
+  "stop-transcribing",
+  withErrorReporting(async (data) => {
+    const { producerId } = data;
+    console.log("stop-transcribing", producerId);
+    stopTranscriptions(producerId);
+  }),
+);
+
 socket.on("disconnect", () => {
   console.log("disconnect");
-  for (let demuxer of Object.values(demuxers)) {
-    demuxer.interrupt();
+  for (let state of Object.values(streamState)) {
+    state.demuxer.interrupt();
   }
-  demuxers = {};
+  streamState = {};
 });
 
 function withErrorReporting(fn: (data: any) => Promise<any>) {
@@ -168,6 +177,71 @@ function withErrorReporting(fn: (data: any) => Promise<any>) {
       captureException(error);
     });
   };
+}
+
+function startTranscriptions(producerId: string) {
+  const state = streamState[producerId];
+
+  if (state == null) {
+    throw new Error(`No Producer with id ${producerId}`);
+  }
+
+  if (state.passThroughForTranscriptions != null) {
+    throw new Error(`Already running transcriptions on producer ${producerId}`);
+  }
+
+  // Do a deep clone of the stream config.
+  // This is necessary to prevent a crash during cleanup when two muxers are sharing the
+  // same config.
+  const streamConfig = JSON.parse(JSON.stringify(state.demuxer.streams[0]));
+
+  // A new muxer instance is creating everytime the connection to Google is restarted.
+  // This also requires a new PassThrough is created.
+  function createReadableStream() {
+    const { packetStream } = state;
+
+    const pt = new PassThrough({ objectMode: true });
+    packetStream.pipe(pt);
+
+    const muxerStream = createOggMuxer(pt, streamConfig);
+
+    muxerStream.on("close", () => {
+      // Stop sending packets to the muxer and signal and end. This is necessary to get the muxer
+      // loop to cleanly exit
+      packetStream.unpipe(pt);
+      pt.end();
+    });
+
+    state.passThroughForTranscriptions = pt;
+
+    return muxerStream;
+  }
+
+  startRestartableRecognizeStream(
+    createReadableStream,
+    { channelCount: streamConfig.codecpar.channels, sampleRate: streamConfig.codecpar.sample_rate },
+    state.nativeLang,
+    (recognizeResponse: any) => {
+      logRecognizeResponse(recognizeResponse);
+      socket.emit("recognize-response", { producerId, recognizeResponse });
+    },
+  );
+}
+
+function stopTranscriptions(producerId: string) {
+  const state = streamState[producerId];
+
+  if (state == null) {
+    throw new Error(`No Producer with id ${producerId}`);
+  }
+
+  if (state.passThroughForTranscriptions == null) {
+    throw new Error(`Not running transcriptions on producer ${producerId}`);
+  }
+
+  state.packetStream.unpipe(state.passThroughForTranscriptions);
+  state.passThroughForTranscriptions.end();
+  state.passThroughForTranscriptions = null;
 }
 
 type RecordingProps = {
@@ -228,25 +302,25 @@ class PacketStreamFromDemuxer extends Readable {
   demuxer: Demuxer;
 
   _read(n: number) {
-    this.demuxer.read().then((packet) => {
-      this.push(packet);
-    }, (error) => {
-      // This is the string version of AVERROR_EXIT from ffmpeg. Unfortunately, beamcoder doesn't
-      // expose error codes directly, so we have to do a string match.
-      // This error is expected to be thrown when demuxer.interrupt() is caled.
-      if (error.message.indexOf("Immediate exit requested") === -1) {
-        this.destroy(error);
-      } else {
-        // TODO: Should this also call destroy? Or close?,
-        // Otherwise a close event is never emitted
-        this.push(null);
-      }
-    });
+    this.demuxer.read().then(
+      (packet) => {
+        this.push(packet);
+      },
+      (error) => {
+        // This is the string version of AVERROR_EXIT from ffmpeg. Unfortunately, beamcoder doesn't
+        // expose error codes directly, so we have to do a string match.
+        // This error is expected to be thrown when demuxer.interrupt() is caled.
+        if (error.message.indexOf("Immediate exit requested") === -1) {
+          this.destroy(error);
+        } else {
+          this.push(null);
+        }
+      },
+    );
   }
 }
 
-function createOggMuxer(opusPackets: Readable, streamConfig: object, props: RecordingProps): Readable {
-
+function createOggMuxer(opusPackets: Readable, streamConfig: object): Readable {
   // The way governor.cc and adapter.h are written, buffers won't
   // get emitted until this highwaterMark is reached.
   // 64 seems to be the magic number that will release a buffer after every frame
@@ -276,58 +350,50 @@ function createOggMuxer(opusPackets: Readable, streamConfig: object, props: Reco
     await muxer.writeHeader();
 
     for await (const packet of opusPackets) {
-      if (packet == null)
-        break;
-
-      // if (muxerStream.destroyed) {
-      //   console.log("muxer destroyed detected. breaking")
-      //   break;
-      // }
+      if (packet == null) break;
 
       await muxer.writeFrame(packet);
     }
 
     await muxer.writeTrailer();
-    console.log("leaving muxer loop")
   }
 
-  run().catch(error => {
-    // TODO: Do something with this?
+  run().catch((error) => {
+    captureException(error);
     console.error(error);
   });
 
   return muxerStream;
-
-  // TODO: comment this back in
-  //uploadToS3(muxerStream, props.codec.mimeType, props.producerId);
-
 }
 
-function startTranscriptions(
-    createReadableStream: () => Readable,
-    opusHeaderProps: OpusHeaderProps,
-    languageCode: string,
-    onResponse: (data: any) => void) {
+function startRestartableRecognizeStream(
+  createReadableStream: () => Readable,
+  opusHeaderProps: OpusHeaderProps,
+  languageCode: string,
+  onResponse: (data: any) => void,
+) {
   const streamingRecognizeRequest = {
     config: {
       languageCode,
       enableWordTimeOffsets: true,
-      encoding: 'OGG_OPUS',
+      encoding: "OGG_OPUS",
       audioChannelCount: opusHeaderProps.channelCount,
       sampleRateHertz: opusHeaderProps.sampleRate,
     },
     interimResults: true,
   };
 
-  let counter = 0;
-
   function go() {
     console.log(`Starting recognizeRequest for ${languageCode}`);
 
     const readableStream = createReadableStream();
-    readableStream.counter = counter++;
+
+    function endListener() {
+      removeListeners();
+    }
 
     function errorListener(error: Error) {
+      console.error(error);
       removeListeners();
 
       // https://cloud.google.com/speech-to-text/docs/reference/rpc/google.rpc#google.rpc.Code
@@ -340,14 +406,14 @@ function startTranscriptions(
 
         // TODO: Try waiting for a silence in conversation, and restarting the stream after 3-4 minutes.
         // This may result in a better user experience
-        console.log(`OUT_OF_RANGE error from RecognizeStream. Restarting. message=${error.message}`)
+        console.log(
+          `OUT_OF_RANGE error from RecognizeStream. Restarting. message=${error.message}`,
+        );
         go();
       } else {
-        // TODO: Stop sending data from the muxer
         console.error(error);
         captureException(error);
       }
-      console.log(`Got here ${readableStream.counter}`)
     }
 
     function dataListener(data: any) {
@@ -357,50 +423,29 @@ function startTranscriptions(
     const recognizeStream = speechClient
       .streamingRecognize(streamingRecognizeRequest)
       .on("data", dataListener)
-      .on("error", errorListener);
+      .on("error", errorListener)
+      .on("end", endListener);
 
-    // TODO: Why doesn't the pipe work on reconnect?
     readableStream.pipe(recognizeStream);
 
-    // let packetCounter = 0;
-    // function readableDataListener(packet) {
-    //   packetCounter++;
-    //   if (packetCounter > 200) {
-    //     console.log("200 ogg packets read from muxer");
-    //     packetCounter = 0;
-    //   }
-    //   recognizeStream.write(packet);
-    // }
-
-    // function readableEndListener() {
-    //   console.log("readableEndListener")
-    //   recognizeStream.end();
-    //   removeListeners();
-    // }
-
     function readableErrorListener() {
-      console.log("readableErrorListener")
       recognizeStream.end();
       removeListeners();
     }
 
-    //readableStream.on("data", readableDataListener);
-    //readableStream.on("end", readableEndListener);
     readableStream.on("error", readableErrorListener);
 
-    console.log(`starting pipe for stream ${readableStream.counter} ${readableStream.readableFlowing}`)
-
     function removeListeners() {
-      console.log(`removing listeners for stream ${readableStream.counter}`)
       recognizeStream.removeListener("data", dataListener);
       recognizeStream.removeListener("error", errorListener);
+      recognizeStream.removeListener("end", endListener);
 
-      //readableStream.removeListener("data", readableDataListener);
-      //readableStream.removeListener("end", readableEndListener);
       readableStream.removeListener("error", readableErrorListener);
       readableStream.unpipe(recognizeStream);
 
-      // TODO: Will this actually stop the muxer loop from running?
+      recognizeStream.destroy();
+
+      // Necessary to trigger muxer cleanup
       readableStream.destroy();
     }
   }
@@ -424,14 +469,16 @@ function uploadToS3(readableStream: Readable, mimeType: string, producerId: stri
   // Need to call promise to actually start the reading from muxerStream
   const promise = s3Upload.promise();
 
-  promise.then(() => { console.log(`Finished S3 upload to ${s3Key}`); });
+  promise.then(() => {
+    console.log(`Finished S3 upload to ${s3Key}`);
+  });
 
   return promise;
 }
 
 type OpusHeaderProps = {
-  channelCount: number,
-  sampleRate: number,
+  channelCount: number;
+  sampleRate: number;
 };
 
 function buildOpusHeader(props: OpusHeaderProps): Buffer {
@@ -539,9 +586,11 @@ function choosePort() {
 
 function logRecognizeResponse(response: any) {
   if (Array.isArray(response.results)) {
-    const str = response.results.map((result: any) => {
-      return result.alternatives[0].transcript;
-    }).join(" ");
+    const str = response.results
+      .map((result: any) => {
+        return result.alternatives[0].transcript;
+      })
+      .join(" ");
     console.log("Transcript: " + str);
   }
 }

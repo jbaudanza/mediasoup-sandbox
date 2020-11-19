@@ -211,6 +211,14 @@ function emitToRoom(roomId: string, eventName: string, data: object) {
   io.to(`room:${roomId}`).emit(eventName, data);
 }
 
+function emitToMediaProcessor(eventName: string, data: object) {
+  if (mediaProcessorSocketId == null) {
+    console.warn(`Unable to send ${eventName} message. Media processor offline.`)
+  } else {
+    io.to(mediaProcessorSocketId).emit(eventName, data);
+  }
+}
+
 async function setSocketHandlers(socket: SocketIO.Socket) {
   function logSocket(msg: string) {
     console.log(`[${new Date().toISOString()}] ${socket.handshake.address} ${socket.id} ${msg}`)
@@ -568,13 +576,15 @@ function setSocketHandlersForRoom(socket: SocketIO.Socket, userId: number, roomI
 
     updatePeers(roomId);
 
-    if (appData.recording && mediaProcessorSocketId) {
-      io.to(mediaProcessorSocketId).emit("start-recording", {
-        roomId: roomId,
-        producerId: producer.id,
-        userId,
-        nativeLang: appData.nativeLang
-      });
+    if (appData.recording) {
+      emitToMediaProcessor(
+        "start-recording", {
+          roomId: roomId,
+          producerId: producer.id,
+          userId,
+          nativeLang: appData.nativeLang
+        }
+      );
     }
 
     return { id: producer.id };
@@ -797,15 +807,16 @@ function setSocketHandlersForRoom(socket: SocketIO.Socket, userId: number, roomI
 
     const producer = producerFromMediaTag(request.peerId, request.mediaTag);
 
-    socket.join(`producer:${producer.id}`)
-
+    emitToMediaProcessor("start-transcribing", { producerId: producer.id });
+    socket.join(`producer:${producer.id}`);
   }));
 
   socket.on('stop-transcribing', withAsyncSocketHandler(async (data) => {
-    logSocket("stop-transcribing")
     const request = protocol.stopTranscribingRequest(data);
+    logSocket(`stop-transcribing peerId=${request.peerId}`);
     const producer = producerFromMediaTag(request.peerId, request.mediaTag);
-    socket.leave(`producer:${producer.id}`)
+    emitToMediaProcessor("stop-transcribing", { producerId: producer.id });
+    socket.leave(`producer:${producer.id}`);
   }));
 
   function producerFromMediaTag(peerId: string, mediaTag: string): Producer {
