@@ -323,18 +323,8 @@ function startTranscriptions(
     // readableStream.pipe(), but for some reason I couldn't get it to restart correctly
     // after an OUT_OF_RANGE error.
     //
-    let counter = 0;
-    let counter2 = 0;
     function muxerDataListener(buffer: any) {
-      counter++;
-      counter2++;
-      if (counter > 100) {
-        console.log("100 packets");
-        counter = 0;
-      }
-      if (counter2 >= 0) {
-        recognizeStream.write(buffer);
-      }
+      recognizeStream.write(buffer);
     }
     function muxerErrorListener() {
       recognizeStream.end();
@@ -350,7 +340,6 @@ function startTranscriptions(
     function removeListeners() {
       recognizeStream.removeListener("data", dataListener);
       recognizeStream.removeListener("error", errorListener);
-      recognizeStream.destroy(); // TODO: I don't thin I need this
 
       readableStream.removeListener("data", muxerDataListener);
       readableStream.removeListener("error", muxerErrorListener);
