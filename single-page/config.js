@@ -1,14 +1,4 @@
 module.exports = {
-  // http server ip, port, and peer timeout constant
-  //
-  httpIp: '0.0.0.0',
-  httpPort: 3000,
-  httpPeerStale: 15000,
-
-  // ssl certs. we'll start as http instead of https if we don't have
-  // these
-  sslCrt: 'local.crt',
-  sslKey: 'local.key',
 
   mediasoup: {
     worker: {
@@ -74,15 +64,7 @@ module.exports = {
         ]
     },
 
-    // rtp listenIps are the most important thing, below. you'll need
-    // to set these appropriately for your network for the demo to
-    // run anywhere but on localhost
     webRtcTransport: {
-      listenIps: [
-       { ip: '127.0.0.1', announcedIp: null },
-       // { ip: '192.168.42.68', announcedIp: null },
-       { ip: '10.10.23.101', announcedIp: null },
-      ],
       initialAvailableOutgoingBitrate: 800000,
     }
   }

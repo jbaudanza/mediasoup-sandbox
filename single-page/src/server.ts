@@ -6,6 +6,7 @@ import * as mediasoup from "mediasoup";
 import express from "express";
 import socketio from "socket.io";
 import socketioJwt from "socketio-jwt";
+import fetch from "node-fetch";
 
 import * as Sentry from "@sentry/node";
 
@@ -13,7 +14,7 @@ import * as protocol from "./protocol";
 
 Sentry.init({ dsn: process.env["SENTRY_DSN"] });
 
-const https = require('https');
+const http = require('http');
 const fs = require('fs');
 
 const expressApp = express();
@@ -104,22 +105,6 @@ type Peer = {
 // correlate tracks.
 //
 
-function createHttpsServer() {
-  const https = require('https');
-
-  const tls = {
-    cert: fs.readFileSync(config.sslCrt),
-    key: fs.readFileSync(config.sslKey),
-  };
-  return https.createServer(tls, expressApp);
-}
-
-function createHttpServer() {
-  const http = require('http');
-  const server = http.createServer(expressApp);
-  return server;
-}
-
 let io: SocketIO.Server;
 
 function updatePeers(roomId: string) {
@@ -155,28 +140,16 @@ async function main() {
   worker = await startMediasoup();
 
   // start https server, falling back to http if https fails
-  console.log('starting express');
-  let server;
-  try {
-    server = createHttpsServer();
-  } catch (e) {
-    if (e.code === 'ENOENT') {
-      console.error('no certificates found (check config.js)');
-      console.error('  could not start https server ... trying http');
-      server = createHttpServer();
-    } else {
-      throw e;
-    }
-  }
+  const server = http.createServer(expressApp);
 
   server.on('error', (e: Error) => {
-    console.error('https server error,', e.message);
+    console.error(e);
     process.exit(1);
   });
 
-  server.listen(config.httpPort, config.httpIp, () => {
-    console.log(`server is running and listening on ` +
-                    `https://${config.httpIp}:${config.httpPort}`);
+  const httpPort = process.env['PORT'] || 3000;
+  server.listen(httpPort,  () => {
+    console.log(`HTTP server listening on ${httpPort}`);
   });
 
   //
@@ -880,16 +853,6 @@ async function startMediasoup() {
   return worker;
 }
 
-//
-// -- our minimal signaling is just http polling --
-//
-
-// parse every request body for json, no matter the content-type. this
-// lets us use sendBeacon or fetch interchangeably to POST to
-// signaling endpoints. (sendBeacon can't set the Content-Type header)
-//
-expressApp.use(express.json({ type: '*/*' }));
-
 async function closePeer(roomId: string, peerId: string) {
   log('closing peer', peerId);
   const room = roomState[roomId];
@@ -976,6 +939,33 @@ async function closeConsumer(roomId: string, consumer: Consumer) {
   }
 }
 
+// This configures the listenIps based off of the ECS metadata file.
+//
+// https://docs.aws.amazon.com/AmazonECS/latest/userguide/task-metadata-endpoint-v4-fargate.html
+async function getListenIps(): Promise<Array<{ip: string, announcedIp: string | null}>> {
+  const metadataUrl = process.env['ECS_CONTAINER_METADATA_URI_V4'];
+  if (metadataUrl) {
+    return fetch(metadataUrl + "/task").then(r => r.json()).then(response => {
+
+      console.log(response);
+
+      return response["Networks"][0]["IPv4Addresses"].map((publicIp: string) => ({
+        ip: "0.0.0.0", announcedIp: publicIp
+      }))
+    });
+  } else {
+    return Promise.resolve([{ ip: '127.0.0.1', announcedIp: null }]);
+  }
+}
+
+const listenIps = getListenIps().then(result => {
+  console.log("ListenIps: " + JSON.stringify(result));
+},
+(e) => {
+  Sentry.captureException(e);
+  process.exit(1);
+});
+
 async function createWebRtcTransport(params: { router: Router, peerId: string, direction: string }) {
   const { peerId, direction, router } = params;
   const {
@@ -994,6 +984,10 @@ async function createWebRtcTransport(params: { router: Router, peerId: string, d
 
   return transport;
 }
+
+expressApp.get("/health-check", (req, res) => {
+  res.json({ status: "OK" });
+});
 
 expressApp.use(notFoundHandler);
 expressApp.use(errorHandler);
