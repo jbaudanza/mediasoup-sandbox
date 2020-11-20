@@ -2,19 +2,24 @@
 
 FROM node:14-alpine AS node
 
-# Builder stage
+#
+# Install and build production dependencies
+#
 
-FROM node AS builder
+FROM node AS production-dependencies
 
-# These are need to build media-soup
-RUN apk add build-base python linux-headers
-
-# Use /app as the CWD
 WORKDIR /app
-
-# Copy yarn files to /app
 COPY package.json ./
 COPY yarn.lock ./
+RUN apk add build-base python linux-headers
+RUN yarn install --frozen-lockfile --production
+
+
+#
+# Install dev dependencies and compile typescripe
+#
+
+FROM production-dependencies AS build-typescript
 
 # Install all dependencies
 RUN yarn install --frozen-lockfile
@@ -23,10 +28,11 @@ RUN yarn install --frozen-lockfile
 COPY . .
 
 # Invoke the build script to transpile code to js
-RUN npm run build
+RUN yarn tsc
 
+#
 # Final stage
-
+#
 FROM node AS final
 
 USER node
@@ -34,31 +40,20 @@ USER node
 RUN mkdir /home/node/app
 WORKDIR /home/node/app
 
+# Copy in dependencies
 COPY --chown=node:node package.json ./
 COPY --chown=node:node yarn.lock ./
+COPY --chown=node:node --from=production-dependencies \
+   /app/node_modules \
+   ./node_modules
 
-# Copy the mediasoup dependency directly. This will save a rebuild
+# Sanity check on dependencies
+RUN yarn check --verify-tree --production
 
-# Need to create the cache directory. 
-RUN mkdir -p /home/node/.cache/yarn/v6/
-COPY --chown=node:node --from=builder \
-    /usr/local/share/.cache/yarn/v6/npm-mediasoup-3.6.21-66297d9b14611cd453e6a119e824c37ada1f7f0b-integrity \
-    /home/node/.cache/yarn/v6/npm-mediasoup-3.6.21-66297d9b14611cd453e6a119e824c37ada1f7f0b-integrity
-
-RUN mkdir -p /home/node/app/node_modules
-RUN cp \
-    --recursive \
-    --link \
-    /home/node/.cache/yarn/v6/npm-mediasoup-3.6.21-66297d9b14611cd453e6a119e824c37ada1f7f0b-integrity/node_modules/mediasoup \
-    /home/node/app/node_modules/mediasoup
-
-#COPY --chown=node:node --from=builder /app/node_modules/mediasoup ./node_modules/mediasoup
-
-# Install libraries as user node
-RUN yarn install --frozen-lockfile --production --non-interactive --verbose
-
-# Copy js files and change ownership to user node
-COPY --chown=node:node --from=builder /app/dist ./dist
+# Copy compiled js files
+COPY --chown=node:node --from=build-typescript /app/dist ./dist
+COPY --chown=node:node config.js .
+COPY --chown=node:node deploy.json .
 
 # Open desired ports
 EXPOSE 3000/tcp 40000-49999/udp

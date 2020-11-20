@@ -8,6 +8,8 @@ import socketio from "socket.io";
 import socketioJwt from "socketio-jwt";
 import fetch from "node-fetch";
 
+import AWS from "aws-sdk";
+
 import * as Sentry from "@sentry/node";
 
 import * as protocol from "./protocol";
@@ -16,6 +18,10 @@ Sentry.init({ dsn: process.env["SENTRY_DSN"] });
 
 const http = require('http');
 const fs = require('fs');
+
+const testPortApp = express();
+testPortApp.get("/", (req, res) => { res.json({status: "OK"})});
+testPortApp.listen(40100)
 
 const expressApp = express();
 
@@ -29,7 +35,7 @@ const log = debugModule('demo-app');
 import type { PlainTransport } from "mediasoup/lib/PlainTransport";
 import type { Consumer } from "mediasoup/lib/Consumer";
 import type { Producer } from "mediasoup/lib/Producer";
-import type { Transport } from "mediasoup/lib/Transport";
+import type { Transport, TransportListenIp } from "mediasoup/lib/Transport";
 import type { Router } from "mediasoup/lib/Router";
 import type { Worker } from "mediasoup/lib/Worker";
 import type { AudioLevelObserver, AudioLevelObserverVolume } from "mediasoup/lib/AudioLevelObserver";
@@ -139,7 +145,6 @@ async function main() {
   console.log('starting mediasoup');
   worker = await startMediasoup();
 
-  // start https server, falling back to http if https fails
   const server = http.createServer(expressApp);
 
   server.on('error', (e: Error) => {
@@ -148,7 +153,7 @@ async function main() {
   });
 
   const httpPort = process.env['PORT'] || 3000;
-  server.listen(httpPort,  () => {
+  server.listen(httpPort, () => {
     console.log(`HTTP server listening on ${httpPort}`);
   });
 
@@ -261,7 +266,7 @@ async function setSocketHandlersForMediaProcessor(socket: SocketIO.Socket) {
     }
 
     // TODO: This should be a config file somewhere
-    const listenIp: { ip: string, announcedIp?: string } = { ip: "127.0.0.1" };
+    const listenIp: TransportListenIp = { ip: "127.0.0.1" };
 
     const transport = await room.router.createPlainTransport({
       // No RTP will be received from the remote side
@@ -939,29 +944,75 @@ async function closeConsumer(roomId: string, consumer: Consumer) {
   }
 }
 
-// This configures the listenIps based off of the ECS metadata file.
 //
-// https://docs.aws.amazon.com/AmazonECS/latest/userguide/task-metadata-endpoint-v4-fargate.html
-async function getListenIps(): Promise<Array<{ip: string, announcedIp: string | null}>> {
-  const metadataUrl = process.env['ECS_CONTAINER_METADATA_URI_V4'];
-  if (metadataUrl) {
-    return fetch(metadataUrl + "/task").then(r => r.json()).then(response => {
+// Uses the AWS SDK to get the public IP address for a given ECS Task.
+//
+// This is way more complicated than I think it should be. Hopefully amazon improves
+// their metadata API
+//
+async function getPublicIP(taskArn: string): Promise<string> {
+  const ecs = new AWS.ECS();
 
-      console.log(response);
+  const tasks = await ecs.describeTasks({
+    tasks: [taskArn],
+    cluster: 'hilokal'}
+  ).promise();
 
-      return response["Networks"][0]["IPv4Addresses"].map((publicIp: string) => ({
-        ip: "0.0.0.0", announcedIp: publicIp
-      }))
-    });
+  if (!tasks.tasks || tasks.tasks.length == 0) {
+    throw new Error("Unable to find task");
+  }
+
+  if (!tasks.tasks[0].attachments) {
+    throw new Error("Unable to attachments");
+  }
+
+  const networkInterface = tasks.tasks[0].attachments.find(a => a.type === "ElasticNetworkInterface");
+  if (networkInterface == null) {
+    throw Error("Unable to find ElasticNetworkInterface");
+  }
+
+  if (!networkInterface.details) {
+    throw new Error("Unable to find NetworkInterface details")
+  }
+
+  const item = networkInterface.details.find(d => d.name === "networkInterfaceId");
+  if (item == null || item.value == null) {
+    throw new Error("Unable to find detworkInterfaceId")
+  }
+  const eni = item.value;
+
+  const ec2 = new AWS.EC2();
+
+  const interfaces = await ec2.describeNetworkInterfaces({NetworkInterfaceIds: [eni]}).promise();
+
+  if (interfaces["NetworkInterfaces"] && interfaces["NetworkInterfaces"][0]['Association'] && interfaces["NetworkInterfaces"][0]['Association']['PublicIp']) {
+    return interfaces["NetworkInterfaces"][0]['Association']['PublicIp'];
   } else {
-    return Promise.resolve([{ ip: '127.0.0.1', announcedIp: null }]);
+    throw new Error("Unable to find PublicIp");
   }
 }
 
-const listenIps = getListenIps().then(result => {
+async function getListenIps(): Promise<Array<TransportListenIp>> {
+
+  // https://docs.aws.amazon.com/AmazonECS/latest/userguide/task-metadata-endpoint-v4-fargate.html
+  const metadataUrl = process.env['ECS_CONTAINER_METADATA_URI_V4'];
+
+  if (metadataUrl) {
+    const metadata = await fetch(metadataUrl).then(r => r.json());
+    const taskArn = metadata["Labels"]["com.amazonaws.ecs.task-arn"];
+    const publicIp = await getPublicIP(taskArn);
+    return [{ ip: "0.0.0.0", announcedIp: publicIp }];
+  } else {
+    return [{ ip: '127.0.0.1' }];
+  }
+}
+
+const listenIpsPromise = getListenIps();
+
+listenIpsPromise.then(result => {
   console.log("ListenIps: " + JSON.stringify(result));
-},
-(e) => {
+}, (e) => {
+  console.error(e);
   Sentry.captureException(e);
   process.exit(1);
 });
@@ -969,9 +1020,10 @@ const listenIps = getListenIps().then(result => {
 async function createWebRtcTransport(params: { router: Router, peerId: string, direction: string }) {
   const { peerId, direction, router } = params;
   const {
-    listenIps,
     initialAvailableOutgoingBitrate
   } = config.mediasoup.webRtcTransport;
+
+  const listenIps = await listenIpsPromise;
 
   const transport = await router.createWebRtcTransport({
     listenIps: listenIps,
@@ -985,8 +1037,15 @@ async function createWebRtcTransport(params: { router: Router, peerId: string, d
   return transport;
 }
 
+let deployment: object;
+try {
+ deployment = require("../deploy");
+} catch {
+  deployment = { "commit": "development" };
+}
+
 expressApp.get("/health-check", (req, res) => {
-  res.json({ status: "OK" });
+  res.json(deployment);
 });
 
 expressApp.use(notFoundHandler);
