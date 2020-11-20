@@ -10,6 +10,8 @@ import { Readable, PassThrough } from "stream";
 import { ApiError as GoogleApiError } from "@google-cloud/common";
 import { Status as GoogleStatus } from "google-gax";
 
+import fetch from "node-fetch";
+
 import type { Demuxer, Packet } from "beamcoder";
 
 import { captureException, init as SentryInit } from "@sentry/node";
@@ -44,10 +46,19 @@ export function makeJWT(): string {
   return jsonwebtoken.sign(payload, applicationSecret);
 }
 
-const applicationSecret = process.env["JWT_SECRET"];
+function requireEnv(key: string): string {
+  const value = process.env[key];
+  if (typeof value === "string") {
+    return value;
+  } else {
+    throw new Error(`Missing required env ${key}`);
+  }
+}
+
+const applicationSecret = requireEnv("JWT_SECRET");
 const jwt = makeJWT();
 
-const socket = SocketIO("ws://0.0.0.0:3000", {
+const socket = SocketIO(requireEnv("MEDIASOUP_URL"), {
   transports: ["websocket"],
   jsonp: false,
   transportOptions: {
@@ -89,7 +100,7 @@ socket.on(
   withErrorReporting(async (data) => {
     const { userId, roomId, producerId, nativeLang } = data;
 
-    const ipAddress = "127.0.0.1"; // TODO: should come from a config somewhere
+    const ipAddress = await listenIpPromise;
     const rtpPort = choosePort();
     const rtcpPort = choosePort();
 
@@ -170,6 +181,32 @@ socket.on("disconnect", () => {
   streamState = {};
 });
 
+async function getListenIp(): Promise<string> {
+  // https://docs.aws.amazon.com/AmazonECS/latest/userguide/task-metadata-endpoint-v4-fargate.html
+  const metadataUrl = process.env["ECS_CONTAINER_METADATA_URI_V4"];
+
+  if (metadataUrl) {
+    const metadata = await fetch(metadataUrl).then((r) => r.json());
+    const ipAddress = metadata["Networks"][0]["IPv4Addresses"][0];
+    return ipAddress;
+  } else {
+    return "127.0.0.1";
+  }
+}
+
+const listenIpPromise = getListenIp();
+
+listenIpPromise.then(
+  (ipAddress) => {
+    console.log(`Listening for RTP on ${ipAddress}`);
+  },
+  (error) => {
+    captureException(error);
+    console.error(error);
+    process.exit(1);
+  },
+);
+
 function withErrorReporting(fn: (data: any) => Promise<any>) {
   return (data: any) => {
     fn(data).catch((error: Error) => {
@@ -222,7 +259,7 @@ function startTranscriptions(producerId: string) {
     { channelCount: streamConfig.codecpar.channels, sampleRate: streamConfig.codecpar.sample_rate },
     state.nativeLang,
     (recognizeResponse: any) => {
-      logRecognizeResponse(recognizeResponse);
+      //logRecognizeResponse(recognizeResponse);
       socket.emit("recognize-response", { producerId, recognizeResponse });
     },
   );
@@ -560,23 +597,14 @@ function dataUrl(input: string): string {
   return "data:application/sdp;base64," + Buffer.from(input).toString("base64");
 }
 
-function requireEnv(key: string): string {
-  const value = process.env[key];
-  if (typeof value === "string") {
-    return value;
-  } else {
-    throw new Error(`Missing required env ${key}`);
-  }
-}
-
-const minPort = parseInt(requireEnv("MIN_PORT"));
-const maxPort = parseInt(requireEnv("MAX_PORT"));
+const minPort = parseInt(requireEnv("MIN_RTP_PORT"));
+const maxPort = parseInt(requireEnv("MAX_RTP_PORT"));
 let portCounter = 0;
 
 if (minPort % 2 !== 0) {
   // The RTP spec recommends an even number for RTP port values.
   // https://tools.ietf.org/html/rfc3550#section-11
-  throw new Error("MIN_PORT must be an even value.");
+  throw new Error("MIN_RTP_PORT must be an even value.");
 }
 
 function choosePort() {

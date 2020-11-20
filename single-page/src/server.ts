@@ -129,12 +129,16 @@ function withAsyncHandler(handler: express.Handler): express.Handler {
   };
 }
 
-let applicationSecret: string;
-if (typeof process.env["JWT_SECRET"] !== "string") {
-  throw new Error("Missing JWT_SECRET env variable");
-} else {
-  applicationSecret = process.env["JWT_SECRET"];
+function requireEnv(key: string): string {
+  const value = process.env[key];
+  if (typeof value === "string") {
+    return value;
+  } else {
+    throw new Error(`Missing required env ${key}`);
+  }
 }
+
+const applicationSecret = requireEnv("JWT_SECRET");
 
 //
 // main() -- our execution entry point
@@ -199,7 +203,7 @@ function emitToMediaProcessor(eventName: string, data: object) {
 
 async function setSocketHandlers(socket: SocketIO.Socket) {
   function logSocket(msg: string) {
-    console.log(`[${new Date().toISOString()}] ${socket.handshake.address} ${socket.id} ${msg}`)
+    console.log(`${socket.handshake.address} ${socket.id} ${msg}`)
   }
 
   socket.on('disconnect', (reason) => {
@@ -265,8 +269,7 @@ async function setSocketHandlersForMediaProcessor(socket: SocketIO.Socket) {
       throw Error(`No such room ${request.roomId}`)
     }
 
-    // TODO: This should be a config file somewhere
-    const listenIp: TransportListenIp = { ip: "127.0.0.1" };
+    const networkConfig = await networkConfigPromise;
 
     const transport = await room.router.createPlainTransport({
       // No RTP will be received from the remote side
@@ -275,7 +278,7 @@ async function setSocketHandlersForMediaProcessor(socket: SocketIO.Socket) {
       // FFmpeg and GStreamer don't support RTP/RTCP multiplexing ("a=rtcp-mux" in SDP)
       rtcpMux: false,
 
-      listenIp
+      listenIp: networkConfig.privateIp
     });
 
     transports[transport.id] = transport;
@@ -321,10 +324,8 @@ async function setSocketHandlersForMediaProcessor(socket: SocketIO.Socket) {
       consumer.type
     );
 
-    const ipAddress = (listenIp.ip || listenIp.announcedIp);
-
     return {
-      ipAddress: ipAddress,
+      ipAddress: networkConfig.privateIp,
       rtpParameters: consumer.rtpParameters
     }
   }));
@@ -811,7 +812,7 @@ function setSocketHandlersForRoom(socket: SocketIO.Socket, userId: number, roomI
   }
 
   function logSocket(msg: string) {
-    console.log(`[${new Date().toISOString()}] user_id=${userId} ${msg}`)
+    console.log(`user_id=${userId} ${msg}`)
   }
 
 }
@@ -846,8 +847,8 @@ async function startMediasoup() {
   let worker = await mediasoup.createWorker({
     logLevel: config.mediasoup.worker.logLevel,
     logTags: config.mediasoup.worker.logTags,
-    rtcMinPort: config.mediasoup.worker.rtcMinPort,
-    rtcMaxPort: config.mediasoup.worker.rtcMaxPort,
+    rtcMinPort: parseInt(requireEnv("MIN_RTP_PORT")),
+    rtcMaxPort: parseInt(requireEnv("MAX_RTP_PORT")),
   });
 
   worker.on('died', () => {
@@ -992,25 +993,39 @@ async function getPublicIP(taskArn: string): Promise<string> {
   }
 }
 
-async function getListenIps(): Promise<Array<TransportListenIp>> {
+async function getECSMetadata(): Promise<{privateIp: string, taskArn: string}>{
+  const metadata = await fetch(requireEnv("ECS_CONTAINER_METADATA_URI_V4")).then(r => r.json());
 
   // https://docs.aws.amazon.com/AmazonECS/latest/userguide/task-metadata-endpoint-v4-fargate.html
+  const taskArn = metadata["Labels"]["com.amazonaws.ecs.task-arn"];
+  const privateIp = metadata["Networks"][0]["IPv4Addresses"][0];
+
+  return { taskArn, privateIp };
+}
+
+async function getNetworkConfig(): Promise<{ listenIps: Array<TransportListenIp>, privateIp: string }> {
+
   const metadataUrl = process.env['ECS_CONTAINER_METADATA_URI_V4'];
 
   if (metadataUrl) {
-    const metadata = await fetch(metadataUrl).then(r => r.json());
-    const taskArn = metadata["Labels"]["com.amazonaws.ecs.task-arn"];
-    const publicIp = await getPublicIP(taskArn);
-    return [{ ip: "0.0.0.0", announcedIp: publicIp }];
+    const metadata = await getECSMetadata();
+    const publicIp = await getPublicIP(metadata.taskArn);
+    return {
+      listenIps: [{ ip: "0.0.0.0", announcedIp: publicIp }],
+      privateIp: metadata.privateIp
+    };
   } else {
-    return [{ ip: '127.0.0.1' }];
+    return {
+      listenIps: [{ ip: '127.0.0.1' }],
+      privateIp: "127.0.0.1"
+    };
   }
 }
 
-const listenIpsPromise = getListenIps();
+const networkConfigPromise = getNetworkConfig();
 
-listenIpsPromise.then(result => {
-  console.log("ListenIps: " + JSON.stringify(result));
+networkConfigPromise.then(result => {
+  console.log("NetworkConfig: " + JSON.stringify(result));
 }, (e) => {
   console.error(e);
   Sentry.captureException(e);
@@ -1023,10 +1038,10 @@ async function createWebRtcTransport(params: { router: Router, peerId: string, d
     initialAvailableOutgoingBitrate
   } = config.mediasoup.webRtcTransport;
 
-  const listenIps = await listenIpsPromise;
+  const networkConfig = await networkConfigPromise;
 
   const transport = await router.createWebRtcTransport({
-    listenIps: listenIps,
+    listenIps: networkConfig.listenIps,
     enableUdp: true,
     enableTcp: true,
     preferUdp: true,

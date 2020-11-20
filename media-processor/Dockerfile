@@ -1,6 +1,6 @@
 FROM node:14-alpine AS node
 
-#
+# 
 # Install and build production dependencies
 #
 
@@ -9,7 +9,7 @@ FROM node AS production-dependencies
 WORKDIR /app
 COPY package.json ./
 COPY yarn.lock ./
-RUN apk add build-base python linux-headers
+RUN apk add build-base python libexecinfo-dev ffmpeg-dev
 RUN yarn install --frozen-lockfile --production
 
 
@@ -33,6 +33,8 @@ RUN yarn tsc
 #
 FROM node AS final
 
+RUN apk add ffmpeg-libs libexecinfo
+
 USER node
 
 RUN mkdir /home/node/app
@@ -48,16 +50,17 @@ COPY --chown=node:node --from=production-dependencies \
 # Sanity check on dependencies
 RUN yarn check --verify-tree --production
 
-# Copy compiled js files
+# Copy compiled js files 
 COPY --chown=node:node --from=build-typescript /app/dist ./dist
 COPY --chown=node:node deploy.json .
-COPY --chown=node:node config.js .
 
 # Open desired ports
-EXPOSE 3000/tcp
+EXPOSE 3000/tcp 
 EXPOSE 40000-49999/udp
+EXPOSE 40000-49999/tcp
 
 ENV MIN_RTP_PORT=40000
 ENV MAX_RTP_PORT=49999
 
-ENTRYPOINT ["node", "./dist/server.js"]
+# Use js files to run the application
+ENTRYPOINT ["node", "./dist/index.js"]
